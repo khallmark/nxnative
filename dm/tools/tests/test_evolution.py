@@ -100,6 +100,14 @@ class CurriculumTests(unittest.TestCase):
             with self.subTest(field=field,value=value),self.assertRaises(ValueError):
                 validate_tasks([{**task,field:value}])
 
+    def test_pass_through_is_checkpoint_only_and_final_target_must_settle(self):
+        task=dict(kind='checkpoint_navigation',start=[0,0,0],targets=[[1,0,0],[2,0,0]],
+                  bounds=[[-3,3],[-1,1],[-2,2]],min_health=12,timeout=10,settle_targets=[False,True])
+        validate_tasks([task])
+        for bad in [dict(settle_targets=[]),dict(settle_targets=[False,False]),dict(settle_targets=[0,True]),
+                    dict(settle_targets=[True]),dict(kind='reciprocal_navigation')]:
+            with self.subTest(bad=bad),self.assertRaises(ValueError):validate_tasks([{**task,**bad}])
+
 
 class PolicyTests(unittest.TestCase):
     def state(self,position=(0,0,0),health=12) -> dict[str, Any]:
@@ -126,6 +134,29 @@ class PolicyTests(unittest.TestCase):
         env=LiveTrials(FakeBridge(),io.StringIO())
         task=dict(timeout=10,bounds=[[-2,2],[-1,1],[-2,2]],min_health=8)
         with self.assertRaises(TrialStopped):env.route(task,[(1,0,0)],BASELINE)
+
+    def test_pass_through_does_not_wait_on_intermediate_hazard_lane(self):
+        import io
+        snapshots=iter([self.state(),self.state((1,0,0)),self.state((2,0,0)),self.state((2,0,0))])
+        actions=[]
+        class FakeBridge:
+            def sample(self,keys=None,hold=.15):
+                actions.append(keys);return next(snapshots)
+        task=dict(kind='checkpoint_navigation',timeout=10,bounds=[[-3,3],[-1,1],[-2,2]],min_health=12,
+                  settle_targets=[False,True])
+        result=LiveTrials(FakeBridge(),io.StringIO()).route(task,[(1,0,0),(2,0,0)],BASELINE)
+        self.assertTrue(result['success']);self.assertEqual(result['reached'],2)
+        self.assertEqual(actions.count(''),1);self.assertEqual(actions[-1],'')
+
+    def test_pass_through_cannot_hide_damage_on_arrival(self):
+        import io
+        snapshots=iter([self.state(),self.state((1,0,0),11)])
+        class FakeBridge:
+            def sample(self,*args):return next(snapshots)
+        task=dict(kind='checkpoint_navigation',timeout=10,bounds=[[-3,3],[-1,1],[-2,2]],min_health=12,
+                  settle_targets=[False,True])
+        result=LiveTrials(FakeBridge(),io.StringIO()).route(task,[(1,0,0),(2,0,0)],BASELINE)
+        self.assertFalse(result['success']);self.assertEqual(result['reached'],0)
 
     def test_wrong_height_is_not_arrival(self):
         import io

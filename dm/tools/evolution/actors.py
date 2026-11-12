@@ -99,11 +99,16 @@ class ActorReader:
                 raise ActorUnavailable('Expected one live actor: '+key)
             if found:self.bindings[key]=found[0]
 
-    def current(self):
+    def current_reads(self):
         reads={}
         for actor in self.bindings.values():
             reads[actor['handle']]=self.pool['stride'];reads[actor['address']]=self.obj['size'];reads[actor['nameptr']]=128
-        data=self.read_batch(reads) if reads else {};result={}
+        return reads
+
+    def current(self,data=None):
+        reads=self.current_reads()
+        if data is None:data=self.read_batch(reads) if reads else {}
+        result={}
         for key,actor in self.bindings.items():
             address=actor['address'];slot=self.handle(data[actor['handle']]);header=self.header(data[address],address)
             if slot!=(address,actor['serial']) or header is None or header[0]!=actor['nameptr'] or data[actor['nameptr']].split(b'\0',1)[0]!=actor['name'].encode('ascii'):
@@ -111,9 +116,10 @@ class ActorReader:
             result[key]={**actor,'position':header[1]}
         return result
 
-    def observe(self):
-        if not self.bindings:self.discover()
-        result=self.current()
+    def observe(self,data=None):
+        if not self.bindings:
+            self.discover();data=None
+        result=self.current(data)
         if result is None:
             self.discover();result=self.current()
         if result is None:raise ActorUnavailable('Actor identity changed during observation')

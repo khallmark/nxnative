@@ -120,6 +120,13 @@ after physically moving away from the save position and after a failed episode.
 to `trajectory.jsonl`. A reload that cannot restore the anchor stops evolution;
 a measured trial result is retained even if its subsequent reset fails.
 
+A checkpoint task can set `settle_targets` to one boolean per target. `false`
+marks an intermediate point to pass through without a neutral settling delay;
+the final target must be `true`. Health and 3D bounds are still checked before
+crediting every arrival. Keep the final destination clear of hazards: stopping
+on a boulder lane makes the evaluation depend on surviving an artificial wait.
+Reciprocal tasks retain settled arrival at every point.
+
 ## Actor discovery across scene loads
 
 An optional `actor_discovery` session profile resolves named scene actors through
@@ -148,8 +155,10 @@ The profile contains:
 
 Discovery requires configured UI probes and cannot coexist with a fixed `hazard`
 read. It is bounded to the declared ranges and 64 MiB of scan pages. Cached actor
-observations read small current headers, names and handles; discovery pages are
-not retained on disk. Loading and pause checks use the stable UI/player reads,
+observations read small current headers, names and handles in the same DM_CTL
+request as player/UI state. This avoids a second 100 ms control-file poll per
+action while preserving current identity checks; invalid cached identities still
+trigger rediscovery. Discovery pages are not retained on disk. Loading and pause checks use the stable UI/player reads,
 so a freed scene actor cannot prevent an observed pause. After loading, required
 actors get a bounded readiness check before another trial can begin.
 

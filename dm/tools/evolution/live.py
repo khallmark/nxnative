@@ -48,23 +48,23 @@ class Bridge:
         with self.control.open('a') as f:
             f.write('\n'.join(lines)+'\n')
 
-    def read_memory(self,ranges):
+    def read_memory(self,ranges,commands=()):
         if len(ranges)>4096 or sum(ranges.values())>128*1024*1024 or any(not 0<length<=65536 or not 0<=address<2**64-length for address,length in ranges.items()):
             raise ValueError('Invalid memory read batch')
         paths={address:self.root/(uuid.uuid4().hex+'.bin') for address in ranges}
         try:
-            self.send(*(f'memdump {address:x} {ranges[address]} {path}' for address,path in paths.items()))
+            self.send(*commands,*(f'memdump {address:x} {ranges[address]} {path}' for address,path in paths.items()))
             deadline=time.monotonic()+5.
             while not all(path.exists() and path.stat().st_size==ranges[address] for address,path in paths.items()):
-                if time.monotonic()>deadline:raise TrialStopped('Actor telemetry timed out')
+                if time.monotonic()>deadline:raise TrialStopped('Memory telemetry timed out')
                 time.sleep(.005)
             return {address:path.read_bytes() for address,path in paths.items()}
         finally:
             for path in paths.values():path.unlink(missing_ok=True)
 
-    def with_actors(self,state):
+    def with_actors(self,state,data=None):
         if self.actors is None:return state
-        observed=self.actors.observe()
+        observed=self.actors.observe(data)
         self.last={**state,'actors':observed,'hazard':observed['hazard']['position'] if 'hazard' in observed else None,
                    'time':time.monotonic()}
         return self.last
@@ -82,40 +82,32 @@ class Bridge:
     def sample(self,keys=None,hold=.15,actors=True):
         if keys is not None and (not .05<=hold<=.5 or '\n' in keys or '~' in keys):
             raise ValueError('Input must be a single bounded press')
-        specs=self.config['reads']; paths={k:self.root/(uuid.uuid4().hex+'.bin') for k in specs}
-        lines=[] if keys is None else [f'{keys}~{hold:.4f}']
-        for name,spec in specs.items():
-            fmt='<'+spec['format']; size=struct.calcsize(fmt)
-            if size>65536:
-                raise ValueError('Telemetry read too large')
-            lines.append(f"memdump {int(spec['address'],0):x} {size} {paths[name]}")
-        self.send(*lines)
-        deadline=time.monotonic()+hold+4.
-        try:
-            while not all(p.exists() and p.stat().st_size==struct.calcsize('<'+specs[k]['format']) for k,p in paths.items()):
-                if time.monotonic()>deadline:
-                    raise TrialStopped('Telemetry timed out; no more actions sent')
-                time.sleep(.005)
-            result={k:struct.unpack('<'+specs[k]['format'],p.read_bytes()) for k,p in paths.items()}
-            for name,expected in self.config['identity'].items():
-                if list(result[name])!=[int(v,0) if isinstance(v,str) else v for v in expected]:
-                    raise TrialStopped(f'{name} identity changed; rediscover addresses')
-            hp,maximum=result['health']
-            values=result['position']+result['camera_rotation']+result.get('hazard',())
-            if not all(math.isfinite(v) and abs(v)<1e6 for v in values) or not 0<=hp<=maximum<=80 or not maximum:
-                raise TrialStopped('Invalid position/health telemetry')
-            self.last=dict(time=time.monotonic(),position=result['position'],camera_rotation=result['camera_rotation'],
-                           health=hp,max_health=maximum,hazard=result.get('hazard'),reads=result)
-            if self.actors is not None:
-                if not ui_matches(self.config,self.last,'gameplay'):
-                    self.actors.invalidate()
-                elif actors:
-                    try:return self.with_actors(self.last)
-                    except ActorUnavailable as exc:raise TrialStopped(str(exc)) from exc
-            return self.last
-        finally:
-            for p in paths.values():
-                p.unlink(missing_ok=True)
+        # DM_CTL polls the control file every 100 ms. Read cached actor identities
+        # in the same request as player/UI state to avoid a second idle poll.
+        layout={name:(int(spec['address'],0),'<'+spec['format']) for name,spec in self.config['reads'].items()}
+        actor_reads=self.actors.current_reads() if actors and self.actors is not None else {}
+        ranges=dict(actor_reads)
+        for address,fmt in layout.values():
+            ranges[address]=max(ranges.get(address,0),struct.calcsize(fmt))
+        commands=() if keys is None else (f'{keys}~{hold:.4f}',)
+        data=self.read_memory(ranges,commands)
+        result={name:struct.unpack(fmt,data[address][:struct.calcsize(fmt)]) for name,(address,fmt) in layout.items()}
+        for name,expected in self.config['identity'].items():
+            if list(result[name])!=[int(v,0) if isinstance(v,str) else v for v in expected]:
+                raise TrialStopped(f'{name} identity changed; rediscover addresses')
+        hp,maximum=result['health']
+        values=result['position']+result['camera_rotation']+result.get('hazard',())
+        if not all(math.isfinite(v) and abs(v)<1e6 for v in values) or not 0<=hp<=maximum<=80 or not maximum:
+            raise TrialStopped('Invalid position/health telemetry')
+        self.last=dict(time=time.monotonic(),position=result['position'],camera_rotation=result['camera_rotation'],
+                       health=hp,max_health=maximum,hazard=result.get('hazard'),reads=result)
+        if self.actors is not None:
+            if not ui_matches(self.config,self.last,'gameplay'):
+                self.actors.invalidate()
+            elif actors:
+                try:return self.with_actors(self.last,data if actor_reads else None)
+                except ActorUnavailable as exc:raise TrialStopped(str(exc)) from exc
+        return self.last
 
     def unpause(self):
         if self.running:
@@ -266,6 +258,9 @@ def validate_tasks(tasks):
         targets=task.get('targets')
         if not vector(task.get('start')) or not isinstance(targets,list) or not targets or not all(vector(t) for t in targets):
             raise ValueError('Start and nonempty targets must be finite 3D coordinates')
+        settle=task.get('settle_targets')
+        if settle is not None and (task['kind']!='checkpoint_navigation' or not isinstance(settle,list) or len(settle)!=len(targets) or any(type(v) is not bool for v in settle) or not settle[-1]):
+            raise ValueError('Checkpoint settle_targets must match targets and settle at the final target')
         if any(not all(lo<=v<=hi for v,(lo,hi) in zip(point,bounds)) for point in [task['start']]+targets):
             raise ValueError('Start/target outside declared bounds')
         if not isinstance(task.get('min_health'),int) or not 1<=task['min_health']<=80:
@@ -296,12 +291,17 @@ class LiveTrials:
                 raise TrialStopped(reason)
             return dict(success=False,reason=reason,elapsed=time.monotonic()-start,reached=visited,
                         error=distance(state['position'],target),steps=steps,state=state)
-        for target in targets:
+        for index,target in enumerate(targets):
+            settle=reset or task.get('settle_targets',[True]*len(targets))[index]
             last_moving=time.monotonic(); anchor=state['position']
             while True:
                 if getattr(self.bridge,'config',{}).get('ui') and not ui_matches(self.bridge.config,state,'gameplay'):
                     raise TrialStopped('Gameplay interrupted by an unrecognized UI state')
+                if not in_bounds(state,task) or state['health']<initial['health'] or state['health']<task['min_health']:
+                    return failed('Damage/low health or unsafe terrain',target)
                 if distance(state['position'],target)<=task.get('tolerance',.25):
+                    if not settle:
+                        break
                     # A released stick does not stop momentum immediately. Require
                     # settled arrival, otherwise the next episode starts elsewhere.
                     state=self.bridge.sample('',.25)

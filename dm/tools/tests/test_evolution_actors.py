@@ -38,6 +38,18 @@ class ActorReaderTests(unittest.TestCase):
         self.put(0x22000+24,'3f',4,5,6)
         self.assertEqual(self.reader.observe()['hazard']['position'],(4,5,6))
 
+    def test_prefetched_observation_avoids_an_extra_read_batch(self):
+        self.reader.observe();self.put(0x22000+24,'3f',4,5,6)
+        data=self.read_batch(self.reader.current_reads());calls=self.calls
+        self.assertEqual(self.reader.observe(data)['hazard']['position'],(4,5,6))
+        self.assertEqual(self.calls,calls)
+
+    def test_prefetched_freed_actor_still_triggers_rediscovery(self):
+        self.reader.observe();self.put(0x11000+16,'2Q',0,0xffffffff)
+        self.actor(1,0x32000,20,'Rock',(7,8,9))
+        data=self.read_batch(self.reader.current_reads())
+        self.assertEqual(self.reader.observe(data)['hazard']['address'],0x32000)
+
     def test_relocates_after_old_handle_and_object_are_freed(self):
         self.reader.observe();self.put(0x11000+16,'2Q',0,0xffffffff);self.put(0x22000,'Q',0xffffffffffffffff)
         self.actor(1,0x32000,20,'Rock',(7,8,9));new=self.reader.observe()['hazard']
@@ -74,6 +86,26 @@ class ActorReaderTests(unittest.TestCase):
 
 
 class ActorLifecycleTests(unittest.TestCase):
+    def test_player_ui_and_cached_actor_are_one_input_read_request(self):
+        from evolution.live import Bridge
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td);control=root/'control';control.touch()
+            formats={'position':'3f','camera_rotation':'9f','health':'2I','hud':'I','pause':'I'}
+            values={'position':(0,0,0),'camera_rotation':(1,0,0,0,1,0,0,0,1),'health':(12,12),'hud':(1,),'pause':(0,)}
+            config: dict[str,Any]=dict(pid=0,control=str(control),scratch=str(root/'reads'),identity={},
+                reads={name:dict(address=hex(i*128),format=fmt) for i,(name,fmt) in enumerate(formats.items())},
+                ui={'gameplay':[dict(read='hud',equals=1)],'pause':[dict(read='pause',equals=1)]})
+            data={int(spec['address'],0):struct.pack('<'+spec['format'],*values[name]) for name,spec in config['reads'].items()}
+            data[1024]=b'actor123'
+            bridge=Bridge(config);actor=Mock(spec=ActorReader);bridge.actors=actor
+            actor.current_reads.return_value={1024:8};actor.observe.return_value={'hazard':{'position':(4,1,2)}}
+            try:
+                with patch.object(bridge,'read_memory',return_value=data) as read:
+                    state=bridge.sample('L0/1',.1)
+                    read.assert_called_once_with({a:len(v) for a,v in data.items()},('L0/1~0.1000',))
+                    actor.observe.assert_called_once_with(data);self.assertEqual(state['hazard'],(4,1,2))
+            finally:bridge.close()
+
     def test_bad_actor_cannot_prevent_observed_pause(self):
         from evolution.live import Bridge,TrialStopped,ui_matches
         with tempfile.TemporaryDirectory() as td:
@@ -92,7 +124,7 @@ class ActorLifecycleTests(unittest.TestCase):
                     elif line.startswith('memdump '):
                         _,address,size,path=line.split();name,fmt=lookup[int(address,16)]
                         Path(path).write_bytes(struct.pack('<'+fmt,*values[name]))
-            bridge=Bridge(config);actor=Mock(spec=ActorReader);actor.observe.side_effect=ActorUnavailable('freed actor');bridge.actors=actor
+            bridge=Bridge(config);actor=Mock(spec=ActorReader);actor.observe.side_effect=ActorUnavailable('freed actor');bridge.actors=actor;actor.current_reads.return_value={}
             try:
                 with patch.object(bridge,'send',side_effect=send):
                     with self.assertRaisesRegex(TrialStopped,'freed actor'):bridge.sample()
