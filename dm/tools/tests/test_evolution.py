@@ -8,7 +8,7 @@ import unittest
 from typing import Any
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from evolution.core import Evolution, BASELINE, closest_approach, steer
-from evolution.live import LiveTrials, TrialStopped, validate_tasks
+from evolution.live import LiveTrials, TrialStopped, Checkpoint, ui_matches, validate_ui, validate_tasks
 
 TASKS=[{'id':'a'},{'id':'b'}]
 
@@ -134,6 +134,104 @@ class PolicyTests(unittest.TestCase):
             def sample(self,*args):return s
         task=dict(timeout=10,bounds=[[-2,2],[-1,1],[-2,2]],min_health=8)
         with self.assertRaises(TrialStopped):LiveTrials(FakeBridge(),io.StringIO()).route(task,[(1,0,0)],BASELINE)
+
+
+class CheckpointTests(unittest.TestCase):
+    def config(self,path) -> dict[str, Any]:
+        import hashlib
+        return dict(reads={'hud':{'format':'I'},'pause':{'format':'I'}},
+            ui={'gameplay':[dict(read='hud',equals=1)],'pause':[dict(read='pause',equals=1)]},
+            recovery=dict(files={str(path):hashlib.sha256(path.read_bytes()).hexdigest()},
+                steps=[dict(keys='Plus',before='gameplay',after='pause',settle=0),
+                       dict(keys='A',before='pause',after='gameplay',settle=0)]))
+
+    def test_invalid_ui_and_recovery_are_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'save';path.write_bytes(b'checkpoint')
+            c=self.config(path);validate_ui(c)
+            for update in [dict(ui={'pause':[],'gameplay':[]}),
+                           dict(ui={'pause':[dict(read='missing',equals=0)],'gameplay':[dict(read='hud',equals=1)]})]:
+                with self.assertRaises(ValueError):validate_ui({**c,**update})
+            c['recovery']['steps'][0]['keys']='A~30'
+            with self.assertRaises(ValueError):validate_ui(c)
+
+    def test_ui_mask_does_not_confuse_inactive_flags(self):
+        c={'ui':{'pause':[dict(read='flags',mask='0x20000',equals='0x20000')]}}
+        self.assertFalse(ui_matches(c,{'reads':{'flags':[0xfc01]}},'pause'))
+        self.assertTrue(ui_matches(c,{'reads':{'flags':[0x20001]}},'pause'))
+
+    def test_save_changes_abort_before_any_input(self):
+        import io
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'save';path.write_bytes(b'checkpoint')
+            c=self.config(path)
+            class FakeBridge:
+                config=c
+                def wait_ui(self,*args):raise AssertionError('No UI operation allowed')
+            checkpoint=Checkpoint(FakeBridge(),io.StringIO())
+            path.write_bytes(b'new checkpoint')
+            with self.assertRaisesRegex(TrialStopped,'save changed'):checkpoint.restore({})
+            path.unlink()
+            with self.assertRaisesRegex(TrialStopped,'Cannot read checkpoint save'):checkpoint.restore({})
+
+    def test_wrong_menu_stops_before_next_input(self):
+        import io
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'save';path.write_bytes(b'checkpoint');c=self.config(path)
+            class FakeBridge:
+                config=c
+                actions=[]
+                def wait_ui(self,name,*args):
+                    if name=='pause':raise TrialStopped('Expected pause')
+                    return {}
+                def sample(self,keys,*args):self.actions.append(keys)
+            bridge=FakeBridge()
+            with self.assertRaises(TrialStopped):Checkpoint(bridge,io.StringIO()).restore({})
+            self.assertEqual(bridge.actions,['Plus'])
+
+    def test_wrong_loaded_position_is_rejected(self):
+        import io
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/'save';path.write_bytes(b'checkpoint');c=self.config(path)
+            class FakeBridge:
+                config=c
+                def wait_ui(self,*args):return {}
+                def sample(self,*args):return dict(position=(9,0,0),health=12,reads={'hud':[1]})
+            task=dict(start=[0,0,0],bounds=[[-1,1]]*3,min_health=12)
+            with self.assertRaisesRegex(TrialStopped,'does not match'):Checkpoint(FakeBridge(),io.StringIO()).restore(task)
+
+    def test_failed_episode_is_scored_and_restored(self):
+        import io
+        state=PolicyTests().state()
+        class FakeBridge:
+            def sample(self,*args):return state
+        class Recovery(Checkpoint):
+            def __init__(self):self.restored=0
+            def verify_files(self):pass
+            def restore(self,task):self.restored+=1;return state
+        env=LiveTrials(FakeBridge(),io.StringIO());recovery=Recovery();env.checkpoint=recovery
+        task=dict(kind='checkpoint_navigation',start=[0,0,0],targets=[[1,0,0]],bounds=[[-2,2]]*3,min_health=12)
+        env.route=lambda task,targets,genome,reset=False:dict(success=False,reason='timeout',reached=0,elapsed=1.,error=1.,state=state)
+        result=env.evaluate(task,BASELINE)
+        self.assertFalse(result['success']);self.assertLess(result['score'],0)
+        self.assertEqual(recovery.restored,1)
+
+    def test_failed_restore_preserves_result_and_stops(self):
+        import io
+        state=PolicyTests().state()
+        class FakeBridge:
+            def sample(self,*args):return state
+        class Recovery(Checkpoint):
+            def __init__(self):pass
+            def verify_files(self):pass
+            def restore(self,task):raise TrialStopped('wrong checkpoint')
+        env=LiveTrials(FakeBridge(),io.StringIO());recovery=Recovery();env.checkpoint=recovery
+        task=dict(kind='checkpoint_navigation',start=[0,0,0],targets=[[1,0,0]],bounds=[[-2,2]]*3,min_health=12)
+        env.route=lambda task,targets,genome,reset=False:dict(success=False,reason='damage',reached=0,elapsed=1.,error=1.,state=state)
+        with self.assertRaises(TrialStopped) as error:env.evaluate(task,BASELINE)
+        self.assertIsNotNone(error.exception.result)
+        assert error.exception.result is not None
+        self.assertFalse(error.exception.result['success'])
 
 
 if __name__=='__main__':unittest.main()

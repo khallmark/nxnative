@@ -4,15 +4,18 @@
 interface. It reads validated guest memory and emits ordinary, bounded controller
 presses. It does not patch game memory, alter saves or claim game completion.
 
-The current executable curriculum is reciprocal navigation: return to a declared
-start after each route, evaluate every candidate twice, select by its worst trial,
+The executable curriculum supports reciprocal navigation and checkpoint navigation.
+Return to a declared start after each route, evaluate every candidate twice, select
+full-success policies before failures and then by their worst trial,
 retain two parents and mutate/cross over the others. Every generation re-evaluates
 its parents. SQLite commits each finished trial and stores the population and RNG
 state, so an interrupted run resumes the missing trial rather than starting over.
-An implementation or curriculum change requires a new database; fitness measured
+An implementation, session configuration or curriculum change requires a new database; fitness measured
 under different conditions must not silently compete. Failed route attempts can
-be scored and reversed on a declared reciprocal path. Damage, invalid telemetry,
-unsafe height, failed reset or leaving the training bounds stops the live run.
+be scored and reversed on a declared reciprocal path. With checkpoint recovery configured, damage or leaving the training bounds records
+a failed attempt and uses a guarded normal-game Load sequence. Invalid telemetry,
+an unrecognized menu, a changed checkpoint or failed recovery stops the run.
+Reciprocal navigation still stops on damage or an unsafe terrain transition.
 
 ## Running
 
@@ -33,16 +36,17 @@ Scratch paths cannot contain whitespace because of the host command parser.
 
 Each curriculum entry contains:
 
-- `id` and `kind: "reciprocal_navigation"`;
+- `id` and `kind`: `reciprocal_navigation` or `checkpoint_navigation`;
 - `start`: three world coordinates, with optional `start_tolerance` (default 0.3);
 - `targets`: ordered three-coordinate waypoints on a verified reciprocal route;
 - `bounds`: three `[minimum, maximum]` ranges containing that safe route;
 - `min_health`, `timeout` in seconds and optional arrival `tolerance` (default 0.25).
 
-All tasks in this version share a start anchor. Verify the route and its reverse
-before unattended evaluation. A bounding box does not prove terrain is walkable.
-Observe the normal inventory pause menu before using `--start-paused`. The adapter
-owns subsequent pause toggles during that run. Do not use other input tools or
+All tasks in this version share a start anchor. Verify a reciprocal route and its
+reverse before unattended evaluation. Checkpoint tasks require a tested reload
+sequence and a save that restores the declared start and minimum health. A bounding box does not prove terrain is walkable.
+Observe the normal inventory pause menu before using `--start-paused`. With UI probes configured, the adapter verifies the pause and gameplay states
+before proceeding. Without them, it owns subsequent pause toggles during that run. Do not use other input tools or
 manual controls concurrently. The trainer lock prevents another trainer instance,
 but cannot prevent an unrelated process from appending controller commands.
 
@@ -60,9 +64,9 @@ seed and its offspring must all be evaluated again.
 
 Use `--generations 0` to continue evolving until interrupted. SIGINT/SIGTERM retains
 completed evaluations and requests pause. The host releases each input after at
-most 0.4 seconds; loss of telemetry stops further actions. Pause is a normal button
-toggle, not an independently verified game pause API. Death, dialogue and engine
-failure can prevent it; inspect the game before resuming after an abnormal stop.
+most 0.4 seconds; loss of telemetry stops further actions. Pause uses normal controller input. Configured memory predicates verify the
+result; without those predicates it remains an unverified toggle. Death, dialogue
+and engine failure can prevent it; inspect the game after an abnormal stop.
 
 `trajectory.jsonl` records observations and actions; `interruptions.jsonl` records
 aborted trials; `evolution.sqlite` is authoritative for populations and evaluations.
@@ -71,6 +75,51 @@ The steering genes control hold duration, gain, braking, hazard prediction horiz
 repulsion strength and passing side. Hazard prediction assumes locally constant
 velocity; it has not yet been validated on live boulder crossings.
 
+## Checkpoint recovery
+
+The optional session `ui` object maps screen names to nonempty lists of integer
+predicates. Every predicate must match: `read` names a configured telemetry read,
+`index` selects an element (default zero), optional `mask` is bitwise AND, and
+`equals` is the expected integer or hex string. At minimum, define `pause` and
+`gameplay`; the latter must use positive evidence of active gameplay, not merely
+absence of a menu. Validate screen identities as well as visibility flags. A
+freed screen object can retain stale flags. All addresses and UI predicates are
+local, process-specific observations; this is not automatic screen discovery.
+
+The session `recovery` object contains:
+
+- `files`: absolute save-file paths mapped to SHA256 digests. Cover the selected
+  save and metadata that determines its position in the Load list. The files are
+  read only; any hash change aborts recovery and requires a fresh checkpoint and
+  experiment. Preserve an independently verified backup of original saves.
+- `steps`: ordered objects with `keys`, `before`, and `after`. Screen guards name
+  entries in `ui`. Allowed keys are `Plus`, `R`, `L`, `LUp`, `LDown`, `A`, `B`, or
+  an empty neutral input. Optional `hold` is 0.05–0.5 seconds (default 0.15),
+  `settle` is 0–2 seconds (default 0.3), and `timeout` is 0.1–60 seconds (default 3).
+
+Each step observes its required screen, sends one bounded input, then observes the
+expected result. It never retries an uncertain button press. The sequence starts
+and finishes in observed `gameplay`. Save hashes are checked before and after;
+the final position, health and bounds must match the curriculum before another
+trial can begin. A checkpoint task uses this reset after both success and failure.
+Unknown screens and death are not automatically recoverable unless the configured
+flow explicitly handles their observed state; the current gameplay-starting flow
+stops on them.
+
+First test recovery separately from evolution:
+
+```sh
+python3 scripts/evolve_game.py --session /game/run/session.json \
+  --curriculum /game/run/curriculum.json --output /game/run/recovery-check \
+  --start-paused --recover-only
+```
+
+This verifies the configured flow and leaves the game paused. Also verify recovery
+after physically moving away from the save position and after a failed episode.
+`recovery.jsonl` records the standalone check; training recovery events are written
+to `trajectory.jsonl`. A reload that cannot restore the anchor stops evolution;
+a measured trial result is retained even if its subsequent reset fails.
+
 ## Evidence and remaining work
 
 The first live persistent trial in Ocarina of Time exposed momentum after input
@@ -78,7 +127,9 @@ release. Settled arrival and distance-dependent braking fix the reset criterion.
 Automated tests cover deterministic resume, incomplete-generation rejection,
 worst-task selection, implementation/curriculum incompatibility, synthetic search
 improvement, crossing-hazard response, height separation and final-action damage.
-Synthetic tests establish mechanics, not general gameplay ability.
+Synthetic tests establish mechanics, not general gameplay ability. Recovery tests
+cover stale UI flags, changed saves, wrong menus, wrong loaded positions, failed
+episode scoring and preservation of an evaluation when recovery fails.
 
 The user objective remains an evolving agent that beats Ocarina of Time. This
 implementation is its navigation-training foundation. Completion requires all of:

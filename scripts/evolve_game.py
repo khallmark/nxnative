@@ -21,6 +21,7 @@ def main():
     ap.add_argument('--population',type=int,default=8)
     ap.add_argument('--repeats',type=int,default=2)
     ap.add_argument('--start-paused',action='store_true',help='Normal pause menu visually confirmed')
+    ap.add_argument('--recover-only',action='store_true',help='Verify a normal-game checkpoint reload, then pause')
     ap.add_argument('--inspect',action='store_true',help='Read telemetry only; send no buttons')
     args=ap.parse_args()
     if args.generations<0:
@@ -38,10 +39,23 @@ def main():
             ap.error('Visually confirm pause, then pass --start-paused')
         # This version accepts multiple scoring tasks at the same start anchor.
         from evolution.core import distance
-        if any(distance(state['position'],t['start'])>t.get('start_tolerance',.3) for t in tasks):
+        if not args.recover_only and any(t['kind']=='reciprocal_navigation' and distance(state['position'],t['start'])>t.get('start_tolerance',.3) for t in tasks):
             raise TrialStopped('Outside curriculum start: no input sent')
+        if args.recover_only:
+            from evolution.live import Checkpoint
+            if not config.get('recovery'):
+                raise ValueError('--recover-only requires a configured checkpoint')
+            with (args.output/'recovery.jsonl').open('a') as log:
+                checkpoint=Checkpoint(bridge,log)
+                checkpoint.verify_files()
+                bridge.unpause()
+                state=checkpoint.restore(tasks[0])
+                print(json.dumps(dict(event='checkpoint_verified',state=state)),flush=True)
+            return
+        if any(t['kind']=='checkpoint_navigation' for t in tasks) and not config.get('recovery'):
+            raise ValueError('Checkpoint curriculum requires recovery configuration')
         package=Path(__file__).resolve().parents[1]/'dm'/'tools'/'evolution'
-        implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),package/'core.py',package/'live.py'])).hexdigest()
+        implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),package/'core.py',package/'live.py'])+json.dumps(config,sort_keys=True).encode()).hexdigest()
         evolution=Evolution(args.output/'evolution.sqlite',tasks,args.population,args.repeats,implementation=implementation,
                             initial_genome=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else None)
         final=evolution.state['generation']+args.generations
@@ -50,6 +64,8 @@ def main():
         signal.signal(signal.SIGTERM,interrupt)
         with (args.output/'trajectory.jsonl').open('a') as log:
             env=LiveTrials(bridge,log)
+            if env.checkpoint is not None:
+                env.checkpoint.verify_files()
             bridge.unpause()
             while not args.generations or evolution.state['generation']<final:
                 key=evolution.pending()
