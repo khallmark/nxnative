@@ -45,6 +45,16 @@ class EvolutionTests(unittest.TestCase):
             expected=e.state['candidates'][1]
             self.assertEqual(e.advance()['genome'],expected)
 
+    def test_failed_long_route_cannot_outscore_full_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            e=Evolution(Path(td)/'a.db',TASKS,4,2)
+            while (key:=e.pending()) is not None:
+                e.record(key,dict(score=1000 if key[1]==0 else 10-key[1],success=key[1]!=0))
+            expected=e.state['candidates'][1]
+            report=e.advance()
+            self.assertEqual(report['genome'],expected)
+            self.assertTrue(report['all_trials_successful'])
+
     def test_curriculum_changes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             e=Evolution(Path(td)/'a.db',TASKS,4,2);e.db.close()

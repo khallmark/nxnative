@@ -147,12 +147,12 @@ class Evolution:
             rows=[json.loads(x[0]) for x in self.db.execute('SELECT result FROM trials WHERE generation=? AND candidate=?',(self.state['generation'],i))]
             # Worst task/repeat matters; no easy-route average can hide a failure.
             fitness=min(r['score'] for r in rows)
-            scores.append((fitness,statistics.mean(r['score'] for r in rows),i,all(r['success'] for r in rows)))
+            scores.append((all(r['success'] for r in rows),fitness,statistics.mean(r['score'] for r in rows),i))
         scores.sort(reverse=True)
-        parents=[self.state['candidates'][x[2]] for x in scores[:max(2,len(scores)//3)]]
+        parents=[self.state['candidates'][x[3]] for x in scores[:max(2,len(scores)//3)]]
         best=scores[0]
-        report=dict(generation=self.state['generation'],fitness=best[0],mean=best[1],
-                    genome=parents[0],all_trials_successful=best[3])
+        report=dict(generation=self.state['generation'],fitness=best[1],mean=best[2],
+                    genome=parents[0],all_trials_successful=best[0])
         with self.db:
             self.state['champion']=report
             self.state['candidates']=parents[:2]+[self.mutate(self.rng.choice(parents),self.rng.choice(parents)) for _ in range(len(scores)-2)]
