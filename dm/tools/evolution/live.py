@@ -138,8 +138,7 @@ class Bridge:
             if self.config.get('ui'):
                 state=self.sample(actors=False)
                 if ui_matches(self.config,state,'gameplay'):
-                    self.sample('Plus',.15,actors=False)
-                    self.wait_ui('pause')
+                    guarded_pause(self)
             elif self.last is not None and self.last['health']>0:
                 self.send('Plus~0.15')
             self.running=False
@@ -165,6 +164,23 @@ def ui_matches(config,state,name):
         if value!=number(rule['equals']):
             return False
     return True
+
+
+def guarded_pause(bridge,timeout=3.,hold=.15):
+    """Damage stagger can ignore Plus; retry only in positively observed gameplay."""
+    deadline=time.monotonic()+timeout;next_press=0.
+    while True:
+        state=bridge.sample(actors=False)
+        gameplay=ui_matches(bridge.config,state,'gameplay')
+        if ui_matches(bridge.config,state,'pause') and not gameplay:return state
+        if state['health']<=0:raise TrialStopped('Cannot pause during death')
+        now=time.monotonic()
+        if now>=deadline:raise TrialStopped('Pause was not observed before timeout')
+        if gameplay and now>=next_press:
+            bridge.sample('Plus',hold,actors=False)
+            next_press=time.monotonic()+.5
+        else:
+            time.sleep(.05)
 
 
 def validate_ui(config):
@@ -226,15 +242,18 @@ class Checkpoint:
         self.verify_files()
         for index,step in enumerate(self.config['steps']):
             state=self.bridge.wait_ui(step['before'])
-            self.bridge.sample(step['keys'],step.get('hold',.15),actors=False)
-            # These are measured menu animation intervals, not retries of input.
-            time.sleep(step.get('settle',.3))
-            state=self.bridge.wait_ui(step['after'],step.get('timeout',3.))
+            if step['keys']=='Plus' and step['before']=='gameplay' and step['after']=='pause':
+                state=guarded_pause(self.bridge,step.get('timeout',3.),step.get('hold',.15))
+            else:
+                self.bridge.sample(step['keys'],step.get('hold',.15),actors=False)
+                # Other menu inputs are never retried on an uncertain result.
+                time.sleep(step.get('settle',.3))
+                state=self.bridge.wait_ui(step['after'],step.get('timeout',3.))
             self.log.write(json.dumps(dict(event='recovery_step',step=index,state=state))+'\n')
             self.log.flush()
         self.verify_files()
         state=self.bridge.sample('',.3,actors=False)
-        if not ui_matches(self.bridge.config,state,'gameplay') or not in_bounds(state,task) or state['health']<task['min_health'] or distance(state['position'],task['start'])>task.get('start_tolerance',.3):
+        if not ui_matches(self.bridge.config,state,'gameplay') or not in_bounds(state,task) or state['health']<task.get('start_health',task['min_health']) or distance(state['position'],task['start'])>task.get('start_tolerance',.3):
             raise TrialStopped('Loaded checkpoint does not match the declared start/health')
         if self.bridge.config.get('actor_discovery'):
             state=self.bridge.wait_actors()
@@ -265,6 +284,11 @@ def validate_tasks(tasks):
             raise ValueError('Start/target outside declared bounds')
         if not isinstance(task.get('min_health'),int) or not 1<=task['min_health']<=80:
             raise ValueError('Minimum health must be a positive integer <=80')
+        damage=task.get('max_damage',0);start_health=task.get('start_health',task['min_health'])
+        if type(damage) is not int or not 0<=damage<80 or (damage and task['kind']!='checkpoint_navigation'):
+            raise ValueError('Damage allowance requires checkpoint navigation and an integer below80')
+        if type(start_health) is not int or not task['min_health']<=start_health<=80:
+            raise ValueError('Start health must be at least minimum health and at most80')
         for key,default,lo,hi in [('timeout',None,.1,300),('tolerance',.25,.01,1),('start_tolerance',.3,.01,1)]:
             value=task.get(key,default)
             if not isinstance(value,(int,float)) or not math.isfinite(value) or not lo<=value<=hi:
@@ -283,60 +307,48 @@ class LiveTrials:
         self.checkpoint=Checkpoint(bridge,log) if getattr(bridge,'config',{}).get('recovery') else None
 
     def route(self,task,targets,genome,reset=False) -> dict[str, Any]:
-        state=self.bridge.sample(); initial=state; previous=None
-        start=time.monotonic(); visited=0; steps=0
-        deadline=start+task['timeout']
+        state=self.bridge.sample();initial=state;previous=None;damage=0;lowest_health=state['health']
+        start=time.monotonic();visited=0;steps=0;deadline=start+task['timeout']
+        def observe(new_state):
+            nonlocal state,damage,lowest_health
+            damage+=max(0,state['health']-new_state['health'])
+            state=new_state;lowest_health=min(lowest_health,state['health'])
+        def result(success,reason,target):
+            return dict(success=success,reason=reason,elapsed=time.monotonic()-start,reached=visited,
+                        error=distance(state['position'],target),steps=steps,state=state,damage=damage,
+                        initial_health=initial['health'],lowest_health=lowest_health)
+        def unsafe():
+            return not in_bounds(state,task) or state['health']<task['min_health'] or damage>task.get('max_damage',0)
         def failed(reason,target):
-            if task.get('kind')!='checkpoint_navigation':
-                raise TrialStopped(reason)
-            return dict(success=False,reason=reason,elapsed=time.monotonic()-start,reached=visited,
-                        error=distance(state['position'],target),steps=steps,state=state)
+            if task.get('kind')!='checkpoint_navigation':raise TrialStopped(reason)
+            return result(False,reason,target)
         for index,target in enumerate(targets):
             settle=reset or task.get('settle_targets',[True]*len(targets))[index]
-            last_moving=time.monotonic(); anchor=state['position']
+            last_moving=time.monotonic();anchor=state['position']
             while True:
                 if getattr(self.bridge,'config',{}).get('ui') and not ui_matches(self.bridge.config,state,'gameplay'):
                     raise TrialStopped('Gameplay interrupted by an unrecognized UI state')
-                if not in_bounds(state,task) or state['health']<initial['health'] or state['health']<task['min_health']:
-                    return failed('Damage/low health or unsafe terrain',target)
+                if unsafe():return failed('Damage allowance/health or terrain limit exceeded',target)
                 if distance(state['position'],target)<=task.get('tolerance',.25):
-                    if not settle:
-                        break
-                    # A released stick does not stop momentum immediately. Require
-                    # settled arrival, otherwise the next episode starts elsewhere.
-                    state=self.bridge.sample('',.25)
+                    if not settle:break
+                    observe(self.bridge.sample('',.25))
                     if getattr(self.bridge,'config',{}).get('ui') and not ui_matches(self.bridge.config,state,'gameplay'):
                         raise TrialStopped('Gameplay interrupted while settling')
-                    if state['health']<initial['health'] or not in_bounds(state,task):
-                        return failed('Unsafe state while settling at target',target)
-                    if distance(state['position'],target)<=task.get('tolerance',.25):
-                        break
-                if not in_bounds(state,task):
-                    return failed('Left the validated 3D training bounds',target)
-                if state['health']<initial['health'] or state['health']<task['min_health']:
-                    return failed('Damage/low health',target)
-                if time.monotonic()>deadline:
-                    return dict(success=False,reason='timeout',elapsed=time.monotonic()-start,
-                                reached=visited,error=distance(state['position'],target),steps=steps,state=state)
+                    if unsafe():return failed('Unsafe state while settling at target',target)
+                    if distance(state['position'],target)<=task.get('tolerance',.25):break
+                if time.monotonic()>deadline:return result(False,'timeout',target)
                 if distance(anchor,state['position'])>.1:
                     anchor=state['position'];last_moving=time.monotonic()
-                if time.monotonic()-last_moving>2.:
-                    return dict(success=False,reason='stuck',elapsed=time.monotonic()-start,
-                                reached=visited,error=distance(state['position'],target),steps=steps,state=state)
-                decision=steer(state,previous,target,genome)
-                before=state
-                state=self.bridge.sample(decision.keys,decision.hold)
-                steps+=1
+                if time.monotonic()-last_moving>2.:return result(False,'stuck',target)
+                decision=steer(state,previous,target,genome);before=state
+                observe(self.bridge.sample(decision.keys,decision.hold));steps+=1
                 self.log.write(json.dumps(dict(reset=reset,target=target,action=decision.keys,
-                    hold=decision.hold,risk=decision.risk if math.isfinite(decision.risk) else None,**state))+'\n')
-                self.log.flush()
-                # Check even the final action: arrival cannot hide damage or an unsafe fall.
-                if state['health']<initial['health'] or not in_bounds(state,task):
-                    return failed('Damage or unsafe terrain transition',target)
+                    hold=decision.hold,risk=decision.risk if math.isfinite(decision.risk) else None,
+                    damage=damage,**state))+'\n');self.log.flush()
+                if unsafe():return failed('Damage allowance/health or terrain limit exceeded',target)
                 previous=before
             visited+=1
-        return dict(success=True,reason='arrived',elapsed=time.monotonic()-start,reached=visited,
-                    error=distance(state['position'],targets[-1]),steps=steps,state=state)
+        return result(True,'arrived',targets[-1])
 
     def evaluate(self,task,genome):
         state=self.bridge.sample()
@@ -345,14 +357,14 @@ class LiveTrials:
             if self.checkpoint is None:
                 raise TrialStopped('Checkpoint curriculum requires recovery configuration')
             self.checkpoint.verify_files()
-            if distance(state['position'],task['start'])>task.get('start_tolerance',.3) or state['health']<task['min_health']:
+            if distance(state['position'],task['start'])>task.get('start_tolerance',.3) or state['health']<task.get('start_health',task['min_health']):
                 state=self.checkpoint.restore(task)
         if distance(state['position'],task['start'])>task.get('start_tolerance',.3):
             raise TrialStopped('Not at the declared episode start; refusing an uncontrolled reset')
-        if not in_bounds(state,task) or state['health']<task['min_health']:
+        if not in_bounds(state,task) or state['health']<task.get('start_health',task['min_health']):
             raise TrialStopped('Episode preconditions failed')
         result=self.route(task,task['targets'],genome)
-        result['score']=(100 if result['success'] else -100)+10*result['reached']-result['elapsed']-5*result['error']
+        result['score']=(100 if result['success'] else -100)+10*result['reached']-result['elapsed']-5*result['error']-25*result.get('damage',0)
         if use_checkpoint:
             assert self.checkpoint is not None
             try:

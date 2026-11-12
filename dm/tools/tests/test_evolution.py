@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from typing import Any
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from evolution.core import Evolution, BASELINE, closest_approach, steer
@@ -14,10 +15,15 @@ TASKS=[{'id':'a'},{'id':'b'}]
 
 
 class EvolutionTests(unittest.TestCase):
+    def evolution(self,*args,**kwargs):
+        instance=Evolution(*args,**kwargs)
+        self.addCleanup(instance.db.close)
+        return instance
+
     def test_resume_exact_pending_and_random_state(self):
         with tempfile.TemporaryDirectory() as td:
-            a=Evolution(Path(td)/'a.db',TASKS,4,2)
-            b=Evolution(Path(td)/'b.db',TASKS,4,2)
+            a=self.evolution(Path(td)/'a.db',TASKS,4,2)
+            b=self.evolution(Path(td)/'b.db',TASKS,4,2)
             for count in range(16):
                 ka,kb=a.pending(),b.pending()
                 self.assertEqual(ka,kb)
@@ -25,7 +31,7 @@ class EvolutionTests(unittest.TestCase):
                 result=dict(score=float(ka[1]),success=True)
                 a.record(ka,result);b.record(kb,result)
                 if count==5:
-                    b.db.close();b=Evolution(Path(td)/'b.db',TASKS,4,2)
+                    b.db.close();b=self.evolution(Path(td)/'b.db',TASKS,4,2)
             recorded=json.loads(a.db.execute('SELECT result FROM trials WHERE candidate=0 LIMIT 1').fetchone()[0])
             self.assertEqual(recorded['genome'],a.state['candidates'][0])
             self.assertEqual(a.advance(),b.advance())
@@ -34,13 +40,13 @@ class EvolutionTests(unittest.TestCase):
 
     def test_partial_generation_cannot_promote(self):
         with tempfile.TemporaryDirectory() as td:
-            e=Evolution(Path(td)/'a.db',TASKS,4,2)
+            e=self.evolution(Path(td)/'a.db',TASKS,4,2)
             e.record(e.pending(),dict(score=999.,success=True))
             with self.assertRaises(ValueError):e.advance()
 
     def test_worst_task_blocks_lucky_champion(self):
         with tempfile.TemporaryDirectory() as td:
-            e=Evolution(Path(td)/'a.db',TASKS,4,2)
+            e=self.evolution(Path(td)/'a.db',TASKS,4,2)
             while (key:=e.pending()) is not None:
                 score=1000 if key[1]==0 else 10-key[1]
                 if key[1]==0 and key[2]==1:score=-100
@@ -50,7 +56,7 @@ class EvolutionTests(unittest.TestCase):
 
     def test_failed_long_route_cannot_outscore_full_success(self):
         with tempfile.TemporaryDirectory() as td:
-            e=Evolution(Path(td)/'a.db',TASKS,4,2)
+            e=self.evolution(Path(td)/'a.db',TASKS,4,2)
             while (key:=e.pending()) is not None:
                 e.record(key,dict(score=1000 if key[1]==0 else 10-key[1],success=key[1]!=0))
             expected=e.state['candidates'][1]
@@ -60,26 +66,26 @@ class EvolutionTests(unittest.TestCase):
 
     def test_curriculum_changes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
-            e=Evolution(Path(td)/'a.db',TASKS,4,2);e.db.close()
-            with self.assertRaises(ValueError):Evolution(Path(td)/'a.db',[{'id':'different'}],4,2)
+            e=self.evolution(Path(td)/'a.db',TASKS,4,2);e.db.close()
+            with self.assertRaises(ValueError):self.evolution(Path(td)/'a.db',[{'id':'different'}],4,2)
 
     def test_implementation_changes_are_rejected(self):
         with tempfile.TemporaryDirectory() as td:
-            e=Evolution(Path(td)/'a.db',TASKS,4,2,implementation='before');e.db.close()
+            e=self.evolution(Path(td)/'a.db',TASKS,4,2,implementation='before');e.db.close()
             with self.assertRaises(ValueError):
-                Evolution(Path(td)/'a.db',TASKS,4,2,implementation='after')
+                self.evolution(Path(td)/'a.db',TASKS,4,2,implementation='after')
 
     def test_transfer_retains_genes_but_not_old_fitness(self):
         with tempfile.TemporaryDirectory() as td:
             seed={**BASELINE,'gain':1.8}
-            e=Evolution(Path(td)/'new.db',TASKS,4,2,initial_genome=seed)
+            e=self.evolution(Path(td)/'new.db',TASKS,4,2,initial_genome=seed)
             self.assertEqual(e.state['candidates'][0],seed)
             self.assertEqual(e.pending(),(0,0,0,0))
             self.assertIsNone(e.state['champion'])
 
     def test_search_improves_a_fixed_parameter_objective(self):
         with tempfile.TemporaryDirectory() as td:
-            e=Evolution(Path(td)/'a.db',[{'id':'synthetic'}],8,2)
+            e=self.evolution(Path(td)/'a.db',[{'id':'synthetic'}],8,2)
             best=[]
             for generation in range(15):
                 while (key:=e.pending()) is not None:
@@ -217,8 +223,9 @@ class CheckpointTests(unittest.TestCase):
                     return {}
                 def sample(self,keys,*args,**kwargs):self.actions.append(keys)
             bridge=FakeBridge()
-            with self.assertRaises(TrialStopped):Checkpoint(bridge,io.StringIO()).restore({})
-            self.assertEqual(bridge.actions,['Plus'])
+            with patch('evolution.live.guarded_pause',side_effect=TrialStopped('Unknown screen')):
+                with self.assertRaises(TrialStopped):Checkpoint(bridge,io.StringIO()).restore({})
+            self.assertEqual(bridge.actions,[])
 
     def test_wrong_loaded_position_is_rejected(self):
         import io
@@ -229,7 +236,8 @@ class CheckpointTests(unittest.TestCase):
                 def wait_ui(self,*args):return {}
                 def sample(self,*args,**kwargs):return dict(position=(9,0,0),health=12,reads={'hud':[1]})
             task=dict(start=[0,0,0],bounds=[[-1,1]]*3,min_health=12)
-            with self.assertRaisesRegex(TrialStopped,'does not match'):Checkpoint(FakeBridge(),io.StringIO()).restore(task)
+            with patch('evolution.live.guarded_pause',return_value={}):
+                with self.assertRaisesRegex(TrialStopped,'does not match'):Checkpoint(FakeBridge(),io.StringIO()).restore(task)
 
     def test_failed_episode_is_scored_and_restored(self):
         import io

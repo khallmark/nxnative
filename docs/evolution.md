@@ -12,7 +12,7 @@ its parents. SQLite commits each finished trial and stores the population and RN
 state, so an interrupted run resumes the missing trial rather than starting over.
 An implementation, session configuration or curriculum change requires a new database; fitness measured
 under different conditions must not silently compete. Failed route attempts can
-be scored and reversed on a declared reciprocal path. With checkpoint recovery configured, damage or leaving the training bounds records
+be scored and reversed on a declared reciprocal path. With checkpoint recovery configured, exceeding the declared damage allowance or leaving the training bounds records
 a failed attempt and uses a guarded normal-game Load sequence. Invalid telemetry,
 an unrecognized menu, a changed checkpoint or failed recovery stops the run.
 Reciprocal navigation still stops on damage or an unsafe terrain transition.
@@ -40,7 +40,12 @@ Each curriculum entry contains:
 - `start`: three world coordinates, with optional `start_tolerance` (default 0.3);
 - `targets`: ordered three-coordinate waypoints on a verified reciprocal route;
 - `bounds`: three `[minimum, maximum]` ranges containing that safe route;
-- `min_health`, `timeout` in seconds and optional arrival `tolerance` (default 0.25).
+- `min_health`, `timeout` in seconds and optional arrival `tolerance` (default 0.25);
+- checkpoint-only `max_damage` (default zero): cumulative observed health loss
+  allowed per route, independent of the minimum-health floor. Healing does not
+  erase earlier damage. Each lost health unit subtracts 25 from fitness;
+- optional `start_health` (default `min_health`): required health at episode start
+  and after reload. For example, start at 12, allow 2 damage, and stop below 10.
 
 All tasks in this version share a start anchor. Verify a reciprocal route and its
 reverse before unattended evaluation. Checkpoint tasks require a tested reload
@@ -98,7 +103,12 @@ The session `recovery` object contains:
   `settle` is 0–2 seconds (default 0.3), and `timeout` is 0.1–60 seconds (default 3).
 
 Each step observes its required screen, sends one bounded input, then observes the
-expected result. It never retries an uncertain button press. The sequence starts
+expected result. The gameplay-to-pause Plus transition is special: damage stagger
+can ignore a press even with an active HUD. It observes UI state again and may
+retry after 0.5 seconds only while gameplay remains positively identified, within
+the step timeout. An observed pause receives no further press; unknown screens
+receive no retry. Other menu buttons are never retried on an uncertain result.
+The sequence starts
 and finishes in observed `gameplay`. Save hashes are checked before and after;
 the final position, health and bounds must match the curriculum before another
 trial can begin. A checkpoint task uses this reset after both success and failure.

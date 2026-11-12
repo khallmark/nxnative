@@ -100,6 +100,7 @@ class Evolution:
         if row:
             self.state=json.loads(row[0])
             if self.state['signature']!=signature:
+                self.db.close()
                 raise ValueError('Curriculum/config changed: use a new database')
             def tuples(x):
                 return tuple(map(tuples,x)) if isinstance(x,list) else x
@@ -107,6 +108,7 @@ class Evolution:
         else:
             initial=BASELINE if initial_genome is None else initial_genome
             if set(initial)!=set(BOUNDS) or any(not isinstance(initial[k],(int,float)) or not math.isfinite(initial[k]) or not lo<=initial[k]<=hi for k,(lo,hi) in BOUNDS.items()):
+                self.db.close()
                 raise ValueError('Seed genome does not match the current parameter bounds')
             candidates=[initial.copy()]+[self.mutate(initial,initial,.35) for _ in range(population-1)]
             self.state=dict(signature=signature,generation=0,candidates=candidates,champion=None)
