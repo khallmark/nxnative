@@ -1,5 +1,6 @@
 """Regression tests for resumability, selection and live-controller boundaries."""
 import copy
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -25,6 +26,8 @@ class EvolutionTests(unittest.TestCase):
                 a.record(ka,result);b.record(kb,result)
                 if count==5:
                     b.db.close();b=Evolution(Path(td)/'b.db',TASKS,4,2)
+            recorded=json.loads(a.db.execute('SELECT result FROM trials WHERE candidate=0 LIMIT 1').fetchone()[0])
+            self.assertEqual(recorded['genome'],a.state['candidates'][0])
             self.assertEqual(a.advance(),b.advance())
             self.assertEqual(a.state,b.state)
             self.assertEqual(b.pending(),(1,0,0,0))

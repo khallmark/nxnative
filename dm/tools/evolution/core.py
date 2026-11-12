@@ -135,6 +135,7 @@ class Evolution:
     def record(self,key,result):
         if not math.isfinite(result['score']):
             raise ValueError('Nonfinite fitness')
+        result={**result,'genome':self.state['candidates'][key[1]].copy()}
         with self.db:
             self.db.execute('INSERT INTO trials VALUES (?,?,?,?,?)',(*key,canonical(result)))
             self.save()
