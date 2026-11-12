@@ -5,14 +5,70 @@ import tempfile
 import unittest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from evolution.replay import ReplayBridge
+from evolution.replay import ReplayBridge,validate_world_xz
 from evolution.live import TrialStopped
 
 
 class ReplayTests(unittest.TestCase):
     def bridge(self,root):
-        b=ReplayBridge.__new__(ReplayBridge);b.root=Path(root);b.native_status={};b.episode_epoch=None;b.fps=60
+        b=ReplayBridge.__new__(ReplayBridge);b.root=Path(root);b.native_status={};b.episode_epoch=None;b.fps=60;b.world_xz=None
         return b
+
+    def binding(self):
+        return dict(rotation_address='0x1000',guard1_address='0x2000',guard1_value='0x3000',
+                    guard2_address='0x4000',guard2_value='0x5000')
+
+    def test_world_binding_rejects_malformed_and_wrapping_addresses(self):
+        self.assertIsNone(validate_world_xz(None))
+        self.assertEqual(validate_world_xz(self.binding()),self.binding())
+        for value in ({},[],True,{**self.binding(),'extra':'0x1'}):
+            with self.subTest(value=value),self.assertRaises(ValueError):validate_world_xz(value)
+        for name in self.binding():
+            for value in (True,123,'123','0x_1','0x-1','0x10000000000000000'):
+                with self.subTest(name=name,value=value),self.assertRaises(ValueError):
+                    validate_world_xz({**self.binding(),name:value})
+        for name in ('rotation_address','guard1_address','guard2_address'):
+            for value in ('0x0','0x1001','0xfffffffffffffffc'):
+                with self.subTest(name=name,value=value),self.assertRaises(ValueError):
+                    validate_world_xz({**self.binding(),name:value})
+        binding={**self.binding(),'guard1_value':'0x0','guard2_value':'0xFFFFFFFFFFFFFFFF'}
+        normalized=validate_world_xz(binding);assert normalized is not None
+        self.assertEqual(normalized['guard2_value'],'0xffffffffffffffff')
+
+    def test_world_episode_requires_exact_native_mode_and_binding_ack(self):
+        with tempfile.TemporaryDirectory() as td:
+            b=self.bridge(td);b.world_xz=self.binding();calls=[]
+            valid=dict(epoch=7,current_frame=100,left_stick_space='world_xz',world_xz=self.binding(),last_camera_frame=0)
+            def rpc(verb,before=(),after=()):
+                calls.append((verb,Path(before[0]).read_text(),after));return valid
+            b.rpc=rpc
+            b.start_replay('f0:L1/0~f30\n',0x6000)
+            self.assertEqual(b.episode_epoch,7)
+            self.assertEqual(calls,[('replay','f0:L1/0~f30\n',('health=6000:0','world_xz=1000:2000:3000:4000:5000'))])
+            self.assertEqual(list(Path(td).iterdir()),[])
+            for bad in ({},dict(left_stick_space='camera'),dict(world_xz=None),
+                        dict(world_xz={**self.binding(),'guard1_value':'0x9999'}),
+                        dict(last_camera_frame=True),dict(last_camera_frame=-1),dict(last_camera_frame=101)):
+                b.episode_epoch=None
+                reply={**valid,**bad} if bad else dict(epoch=7,current_frame=100)
+                b.rpc=lambda *args,r=reply,**kwargs:r
+                with self.subTest(bad=bad),self.assertRaises(TrialStopped):b.start_replay('f0:L1/0~f30\n')
+                self.assertTrue(b.owns_replay);self.assertIsNone(b.episode_epoch)
+                self.assertEqual(list(Path(td).iterdir()),[])
+
+    def test_world_session_ui_remains_camera_relative_and_old_hosts_are_compatible(self):
+        with tempfile.TemporaryDirectory() as td:
+            b=self.bridge(td);b.world_xz=self.binding();calls=[]
+            def rpc(verb,before=(),after=()):
+                calls.append(after);return dict(epoch=7,current_frame=100)
+            b.rpc=rpc
+            b.start_replay('f0:LUp+A~f9\n',episode=False)
+            self.assertEqual(calls,[()]);self.assertIsNone(b.episode_epoch)
+            b.world_xz=None;b.start_replay('f0:L1/0~f30\n')
+            self.assertEqual(calls,[(),()]);self.assertEqual(b.episode_epoch,7)
+            b.episode_epoch=None
+            b.rpc=lambda *args,**kwargs:dict(epoch=8,current_frame=100,left_stick_space='world_xz',world_xz=self.binding())
+            with self.assertRaises(TrialStopped):b.start_replay('f0:L1/0~f30\n')
 
     def test_split_reads_reassemble_and_leave_no_temporary_files(self):
         with tempfile.TemporaryDirectory() as td:

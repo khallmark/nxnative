@@ -1,15 +1,39 @@
 """Protocol-1 native frame replay and single-file batched memory observations."""
 import json
 import math
+import re
 from collections import deque
 import time
 import uuid
 from .live import Bridge,TrialStopped
 
 
+_WORLD_FIELDS=('rotation_address','guard1_address','guard1_value','guard2_address','guard2_value')
+
+
+def validate_world_xz(binding):
+    """Freeze generic camera addresses/identities without guessing game offsets."""
+    if binding is None:return None
+    if not isinstance(binding,dict) or set(binding)!=set(_WORLD_FIELDS):
+        raise ValueError('Invalid native world-X/Z camera binding')
+    result={}
+    for name in _WORLD_FIELDS:
+        value=binding[name]
+        if not isinstance(value,str) or not re.fullmatch(r'0x[0-9a-fA-F]{1,16}',value):
+            raise ValueError('Invalid native world-X/Z '+name)
+        number=int(value,16)
+        if name.endswith('_address'):
+            size,alignment=(36,4) if name=='rotation_address' else (8,8)
+            if not 0<number<=2**64-1-size or number%alignment:
+                raise ValueError('Invalid native world-X/Z '+name)
+        result[name]=f'0x{number:x}'
+    return result
+
+
 class ReplayBridge(Bridge):
     def __init__(self,config):
         self.native_status={};self.episode_epoch=None;self.owns_replay=False
+        self.world_xz=validate_world_xz(config.get('native_world_xz'))
         self.fps=config.get('replay_fps',60)
         if type(self.fps) is not int or not 1<=self.fps<=240:raise ValueError('Invalid guest replay FPS')
         super().__init__(config)
@@ -47,8 +71,16 @@ class ReplayBridge(Bridge):
                 if type(health_address) is not int or health_address<=0 or health_address%4 or health_address>2**64-5 or type(threshold) is not int or not 0<=threshold<2**32:
                     raise ValueError('Invalid native health guard')
                 guard=(f'health={health_address:x}:{threshold}',)
+            binding=self.world_xz if episode else None
+            if binding is not None:
+                guard+=('world_xz='+':'.join(binding[name][2:] for name in _WORLD_FIELDS),)
             result=self.rpc('replay',(path,),guard)
             self.owns_replay=True
+            if binding is not None:
+                if result.get('left_stick_space')!='world_xz' or result.get('world_xz')!=binding or type(result.get('last_camera_frame')) is not int or not 0<=result['last_camera_frame']<=result['current_frame']:
+                    raise TrialStopped('Native replay did not acknowledge world-X/Z camera binding')
+            elif result.get('left_stick_space','camera')!='camera' or result.get('world_xz') is not None:
+                raise TrialStopped('Native replay unexpectedly changed left-stick coordinates')
             if episode:self.episode_epoch=result['epoch']
             return result
         finally:

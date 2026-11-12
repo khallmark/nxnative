@@ -36,7 +36,9 @@ python3 scripts/evolve_replay.py --session /game/run/native-session.json \
 The objective JSON declares `start`, `target` (3D points), `start_health`, and
 `horizon_frames` (1–1,000,000). Optional fields are `segments` (128), `tolerance`
 (0.5), `start_tolerance` (0.3), `poll_seconds` (0.05), `stall_seconds` (30), and
-`initial_direction` (two stick coordinates, default `[0, 1]`). Use a fresh output
+`initial_direction` (two input coordinates, default `[0, 1]`). With the optional
+world-X/Z mode below, these mean world X and Z; otherwise they are camera-relative
+stick X/Y. Use a fresh output
 folder after changing code, session, objective or mutation settings. An earlier
 compatible chromosome can seed the search with `--seed-champion`; its fitness is
 never imported. Sparse crossover/mutation defaults to a 0.1 mutation probability
@@ -152,6 +154,45 @@ and explicit shutdown unloads the idle script. The profile records measured
 startup and warm-reset latency; automatic death retry must be measured separately.
 A successful native call alone does not certify a completed end-to-end retry.
 
+### World-direction movement genes
+
+A player checkpoint leaves the camera moving. Camera-relative chromosomes can
+therefore take different routes from the same start. The optional session object
+`native_world_xz` makes timeline `Lx/y` mean a world X/Z direction and magnitude.
+The native input loop converts it using the current camera once per guest frame,
+including inside an unchanged held segment; Python still submits an entire attempt.
+Buttons, right stick and UI recovery inputs keep their original meanings.
+
+```json
+{
+  "native_world_xz": {
+    "rotation_address": "0x1000",
+    "guard1_address": "0x2000",
+    "guard1_value": "0x3000",
+    "guard2_address": "0x4000",
+    "guard2_value": "0x5000"
+  }
+}
+```
+
+These are illustrative addresses, not a runnable game binding. All five values
+are hexadecimal uint64 strings. The rotation address points to nine float32
+values in a row-major camera-to-world matrix. Two aligned uint64 equality guards
+bind its identity; select them from verified game evidence. The host rereads both
+guards around the matrix read and rejects unreadable, changed or degenerate data.
+Horizontal right is `(r[0], r[6])`; forward is `(-r[2], -r[8])`. After normalizing
+both projections, the host solves their two-dimensional basis and radially clamps
+the resulting stick to unit length. This convention must be calibrated per game.
+The read is not an atomic scene snapshot. A known camera actor is not proof that
+it remains the active camera through cutscenes or camera-mode transitions.
+
+The adapter requires a matching native mode/binding ACK. Unsupported hosts reject
+the extra option; default camera-relative sessions continue to work. Runtime
+camera failures release scripted input and interrupt evaluation without fitness.
+Changing coordinate modes requires a fresh experiment. Derive a world-mode seed
+from world-space route evidence; reinterpreting old camera-relative champion genes
+changes their actions. Camera normalization does not rewind hazards or random state.
+
 ### Native replay protocol
 
 Start the host with a fresh `DM_CTL` path. `DM_CTL_POLL_US=1000` reduces its command
@@ -159,7 +200,7 @@ poll interval from the default 100,000 microseconds; accepted values are integra
 1,000–1,000,000. The native input loop does not wait for Python observations.
 
 ```text
-replay /absolute/timeline /absolute/ack [health=hex-address:decimal-u32-threshold]
+replay /absolute/timeline /absolute/ack [health=hex-address:decimal-u32-threshold] [world_xz=rotation-address:guard1-address:guard1-value:guard2-address:guard2-value]
 replay_status /absolute/ack
 replay_cancel /absolute/ack
 replay_observe /absolute/read-request /absolute/ack
@@ -183,6 +224,10 @@ cannot prove actor identity; the Python profile provides that validation.
 
 ACKs report `ok`, `error`, `epoch`, `current_frame`, `start_frame`, exclusive
 `end_frame`, `stop_frame`, step indices, `active`, `reason`, and guard evidence.
+World-direction support adds `left_stick_space` (`camera` or `world_xz`),
+`world_xz` (null or the five canonical hexadecimal binding fields above), and
+`last_camera_frame` (zero before the first transform or in camera-relative mode).
+All five `world_xz` command fields are hexadecimal; either option may appear first.
 The observer accepts lines `hex-address decimal-byte-count`, at most 128 ranges,
 4 KiB each and 64 KiB total. Each result has address, size, hexadecimal bytes or
 an explicit error; failed reads never become zero-filled observations. The

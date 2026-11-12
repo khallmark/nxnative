@@ -1,8 +1,25 @@
 // Standalone replay tests reuse the HID test's host stubs and run its baseline suite.
 // clang -O1 -Wall -Werror -Wno-unused-function -I.. -I../gen/<GAME> -I../../games/<GAME> -o build/t_replay t_replay.c ../hle_haptics.c ../hle_bigstack.c
+#include <mach/mach_vm.h>
+#include <stdint.h>
+// Exercise the identity bracket deterministically: change one identity just
+// after the real matrix read, without racing a writer against the test thread.
+static uint64_t camera_test_matrix_address, *camera_test_changed_guard;
+static unsigned camera_test_matrix_reads;
+static kern_return_t camera_test_read(vm_map_read_t task, mach_vm_address_t address, mach_vm_size_t size,
+                                     mach_vm_address_t output, mach_vm_size_t *got) {
+    kern_return_t result = mach_vm_read_overwrite(task, address, size, output, got);
+    if (camera_test_matrix_address && address == camera_test_matrix_address) {
+        ++camera_test_matrix_reads;
+        if (camera_test_changed_guard) { *camera_test_changed_guard ^= 1; camera_test_changed_guard = NULL; }
+    }
+    return result;
+}
+#define mach_vm_read_overwrite camera_test_read
 #define main hid_baseline_main
 #include "t_hid.c"
 #undef main
+#undef mach_vm_read_overwrite
 
 static char replay_test_dir[PATH_MAX];
 static void replay_test_stop(void) {
@@ -20,7 +37,7 @@ static void test_invalid(const char *spec, const char *why) {
 static int test_install(const char *spec, uint64_t address, uint32_t threshold) {
     size_t n = 0; const char *error = NULL; replay_step *steps = test_parse(spec, &n, &error);
     if (!steps) { CHECK(0, "test timeline parses"); return 0; }
-    error = replay_install(steps, n, address, threshold);
+    error = replay_install(steps, n, address, threshold, NULL);
     if (error) { free(steps); CHECK(0, error); return 0; } return 1;
 }
 static uint64_t test_input(uint64_t frame) {
@@ -103,13 +120,175 @@ static void t_replay_frames(void) {
     replay_test_stop(); CHECK(!touch_down, "cancel lifts touch");
     size_t n; const char *error = NULL; replay_step *steps = test_parse("f0:A~f1", &n, &error);
     test_frame = UINT64_MAX - 1;
-    CHECK(!strcmp(replay_install(steps, n, 0, 0), "frame_overflow"), "absolute rebase overflow rejected"); free(steps);
+    CHECK(!strcmp(replay_install(steps, n, 0, 0, NULL), "frame_overflow"), "absolute rebase overflow rejected"); free(steps);
     test_frame = 500; atomic_store(&g_legacy_keys_on, 1);
     steps = test_parse("f0:A~f1", &n, &error); epoch = g_replay.epoch;
-    CHECK(!strcmp(replay_install(steps, n, 0, 0), "legacy_seconds_active") && g_replay.epoch == epoch, "legacy seconds playback excludes replacement");
+    CHECK(!strcmp(replay_install(steps, n, 0, 0, NULL), "legacy_seconds_active") && g_replay.epoch == epoch, "legacy seconds playback excludes replacement");
     free(steps); atomic_store(&g_legacy_keys_on, 0);
     atomic_store(&g_sync_on, 1); g_sync_held = 1; test_install("f0:X~f1", 0, 0);
     CHECK(!atomic_load(&g_sync_on) && !g_sync_held, "legacy frame replay is atomically replaced"); replay_test_stop();
+}
+typedef struct { uint64_t self, tag; float rotation[9]; } camera_fixture;
+static replay_camera camera_test_init(camera_fixture *fixture) {
+    memset(fixture, 0, sizeof *fixture);
+    fixture->self = (uint64_t)(uintptr_t)fixture; fixture->tag = 0x12345678;
+    fixture->rotation[0] = fixture->rotation[4] = fixture->rotation[8] = 1;
+    return (replay_camera){(uint64_t)(uintptr_t)fixture->rotation,
+        (uint64_t)(uintptr_t)&fixture->self, fixture->self,
+        (uint64_t)(uintptr_t)&fixture->tag, fixture->tag};
+}
+static void camera_test_yaw(camera_fixture *fixture, float cosine, float sine) {
+    memset(fixture->rotation, 0, sizeof fixture->rotation);
+    fixture->rotation[0] = fixture->rotation[8] = cosine;
+    fixture->rotation[2] = sine; fixture->rotation[6] = -sine; fixture->rotation[4] = 1;
+}
+static int test_install_world(const char *spec, const replay_camera *camera, uint64_t health) {
+    size_t n = 0; const char *error = NULL; replay_step *steps = test_parse(spec, &n, &error);
+    if (!steps) { CHECK(0, "world timeline parses"); return 0; }
+    error = replay_install(steps, n, health, 0, camera);
+    if (error) { free(steps); CHECK(0, error); return 0; }
+    return 1;
+}
+static void t_replay_world_parse(void) {
+    const char *bad[] = {
+        "world_xz=", "world_xz=1000:2000:1:2008", "world_xz=1000:2000:1:2008:2:3",
+        "world_xz=0:2000:1:2008:2", "world_xz=1001:2000:1:2008:2",
+        "world_xz=1000:0:1:2008:2", "world_xz=1000:2001:1:2008:2",
+        "world_xz=1000:2000:1:0:2", "world_xz=1000:2000:1:2009:2",
+        "world_xz=ffffffffffffffe0:2000:1:2008:2", "world_xz=1000:fffffffffffffff8:1:2008:2",
+        "world_xz=1000:2000:1:fffffffffffffff8:2", "world_xz=1000:2000:-1:2008:2",
+        "world_xz=1000:2000:10000000000000000:2008:2", "world_xz=1000:2000:1:2008:2junk",
+        "world_xz=1000:2000:1::2", "world_xz=1000:2000:1:2008:+2"
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        char *copy = strdup(bad[i]); replay_camera camera = {0};
+        const char *error = replay_camera_parse(copy, &camera);
+        CHECK(error && !strcmp(error, "camera_syntax") && !camera.rotation_address, bad[i]); free(copy);
+    }
+    char good[] = "world_xz=0x1000:2000:0:0X2008:ffffffffffffffff"; replay_camera camera;
+    CHECK(!replay_camera_parse(good, &camera) && camera.rotation_address == 0x1000 &&
+          camera.guard1_value == 0 && camera.guard2_value == UINT64_MAX, "camera fields accept exact hex uint64 values including zero guards");
+}
+static void t_replay_world_math(void) {
+    camera_fixture fixture; replay_camera camera = camera_test_init(&fixture);
+    float basis[4] = {0}; int32_t x, y; key_step step = {.lx = 32767};
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) && x == 32767 && y == 0,
+          "identity camera maps world positive X right");
+    step.lx = 0; step.ly = 32767;
+    CHECK(replay_world_axes(&step, basis, &x, &y) && x == 0 && y == -32767, "identity camera maps world positive Z backward");
+    camera_test_yaw(&fixture, 0, 1); step.lx = 32767; step.ly = 0;
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) && x == 0 && y == -32767,
+          "quarter turn keeps world X direction");
+    camera_test_yaw(&fixture, -1, 0);
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) && x == -32767 && y == 0,
+          "half turn reverses required camera-relative stick");
+    camera_test_yaw(&fixture, sqrtf(.5f), sqrtf(.5f));
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) && abs(x - 23170) <= 1 && abs(y + 23170) <= 1,
+          "diagonal camera produces radial unit stick");
+    camera_test_init(&fixture); fixture.rotation[4] = fixture.rotation[8] = sqrtf(.5f);
+    fixture.rotation[5] = -sqrtf(.5f); fixture.rotation[7] = sqrtf(.5f);
+    step.lx = 8192; step.ly = -16384;
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) && x == 8192 && y == 16384,
+          "pitched camera preserves horizontal direction and partial strength");
+    // Archived live camera capture: pitched and looking almost along world +X.
+    const float observed[9] = {.0199851226f, .0864698812f, -.9960539341f,
+        -1.58111924e-9f, .9962528944f, .0864871591f, .9998002648f, -.00172845484f, .0199102368f};
+    memcpy(fixture.rotation, observed, sizeof observed); step.lx = 32767; step.ly = 0;
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) &&
+          abs(x - 655) <= 1 && abs(y - 32760) <= 1, "archived pitched camera maps world X to nearly forward stick");
+    float skew[] = {1, 0, .6f, -.8f}; step.lx = 0; step.ly = -32767;
+    CHECK(replay_world_axes(&step, skew, &x, &y) && fabsf(x + .6f * y) < 2 && y > 0,
+          "basis inverse cancels cross-axis motion for nonorthogonal projections");
+    step.lx = step.ly = 32767; camera_test_init(&fixture);
+    CHECK(!replay_camera_read(&camera, basis) && replay_world_axes(&step, basis, &x, &y) &&
+          abs(x - 23170) <= 1 && abs(y + 23170) <= 1, "world diagonal clamps radially instead of clipping axes");
+    step.lx = step.ly = 0;
+    CHECK(replay_world_axes(&step, basis, &x, &y) && !x && !y, "neutral stays neutral");
+    float invalid[] = {NAN, INFINITY, -INFINITY, 2.f};
+    for (size_t i = 0; i < sizeof invalid / sizeof *invalid; i++) {
+        camera_test_init(&fixture); fixture.rotation[4] = invalid[i];
+        CHECK(!strcmp(replay_camera_read(&camera, basis), "camera_basis_error"), "all matrix entries must be finite and rotation bounded");
+    }
+    camera_test_init(&fixture); fixture.rotation[8] = .01f;
+    CHECK(!strcmp(replay_camera_read(&camera, basis), "camera_basis_error"), "near-vertical forward basis rejected");
+    camera_test_init(&fixture); fixture.rotation[2] = -1; fixture.rotation[8] = 0;
+    CHECK(!strcmp(replay_camera_read(&camera, basis), "camera_basis_error"), "parallel horizontal basis rejected");
+    camera_test_init(&fixture); fixture.self ^= 1;
+    CHECK(!strcmp(replay_camera_read(&camera, basis), "camera_identity_error"), "first identity mismatch rejected");
+    camera_test_init(&fixture); fixture.tag ^= 1;
+    CHECK(!strcmp(replay_camera_read(&camera, basis), "camera_identity_error"), "second identity mismatch rejected");
+    camera_test_init(&fixture); camera_test_matrix_address = camera.rotation_address;
+    camera_test_changed_guard = &fixture.self;
+    CHECK(!strcmp(replay_camera_read(&camera, basis), "camera_identity_error"), "identity change during matrix read is rejected by closing bracket");
+    camera_test_matrix_address = 0;
+}
+static void t_replay_world_frames(void) {
+    replay_test_stop(); test_frame = 1000;
+    camera_fixture fixture; replay_camera camera = camera_test_init(&fixture);
+    camera_test_matrix_address = camera.rotation_address; camera_test_matrix_reads = 0;
+    CHECK(test_install_world("f0:L1/0+R0.25/-0.5+A+T0.2x0.4~f8 f10:L0/1+X~f2", &camera, 0), "install world timeline");
+    CHECK(camera_test_matrix_reads == 1 && g_replay.camera_frame == UINT64_MAX, "installation validates camera without stamping an input frame");
+    CHECK(test_input(1000) == 0 && camera_test_matrix_reads == 1, "no camera refresh before start frame");
+    CHECK(test_input(1001) == DM_BTN_A && atomic_load(&g_sc_axes) == pack(32767, 0, 8192, -16384), "world input preserves right stick and buttons");
+    int downs = touch_downs; unsigned reads = camera_test_matrix_reads;
+    camera_test_yaw(&fixture, 0, 1); test_input(1001);
+    CHECK(atomic_load(&g_sc_axes) == pack(32767, 0, 8192, -16384) && camera_test_matrix_reads == reads,
+          "same-frame HID reads use one camera snapshot");
+    dm_input_set(DM_BTN_B, 1234, 2345, 0, 0); dm_pad_set(DM_BTN_Y, -4321, 0, 0, 0);
+    test_frame = 1002; keys_sync();
+    CHECK(atomic_load(&g_sc_axes) == pack(0, -32767, 8192, -16384) && g_replay.camera_frame == 1002 && g_replay.applied == 0,
+          "camera rotates a held gene without advancing the timeline");
+    CHECK(!atomic_load(&g_sc_latch) && !atomic_load(&g_sc_peek_latch) && touch_downs == downs && touch_down,
+          "camera refresh creates neither new button edges nor repeated touches");
+    CHECK(atomic_load(&g_btn) == DM_BTN_B && atomic_load(&g_axes) == pack(1234, 2345, 0, 0) &&
+          atomic_load(&g_pad_btn[0]) == DM_BTN_Y && atomic_load(&g_pad_axes[0]) == pack(-4321, 0, 0, 0),
+          "world conversion leaves both physical input sources unchanged");
+    CHECK(test_input(1009) == 0 && !atomic_load(&g_sc_axes) && !touch_down, "world timeline gap releases stick and touch");
+    CHECK(test_input(1011) == DM_BTN_X && atomic_load(&g_sc_axes) == pack(-32767, 0, 0, 0), "world step after gap uses current camera");
+    reads = camera_test_matrix_reads; fixture.self ^= 1;
+    CHECK(test_input(1013) == 0 && !strcmp(g_replay.reason, "completed") && camera_test_matrix_reads == reads,
+          "horizon completion precedes camera identity failure");
+    camera_test_init(&fixture); test_frame = 1020; test_install("f0:L0/1~f4", 0, 0);
+    test_input(1021); camera_test_yaw(&fixture, -1, 0); test_input(1022);
+    CHECK(atomic_load(&g_sc_axes) == pack(0, 32767, 0, 0) && !g_replay.camera.rotation_address,
+          "replacement without world option restores ordinary camera-relative semantics");
+    camera_test_matrix_address = 0; replay_test_stop();
+    dm_input_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0);
+    atomic_store(&g_latch, 0); atomic_store(&g_peek_latch, 0); atomic_store(&g_pad_latch[0], 0);
+}
+static void t_replay_world_failures(void) {
+    camera_fixture fixture; replay_camera camera = camera_test_init(&fixture);
+    replay_test_stop(); test_frame = 1100; test_install("f0:A~f20", 0, 0); test_input(1101);
+    uint64_t epoch = g_replay.epoch; size_t n; const char *error = NULL;
+    replay_step *steps = test_parse("f0:X~f4", &n, &error); fixture.tag ^= 1;
+    error = replay_install(steps, n, 0, 0, &camera);
+    CHECK(error && !strcmp(error, "camera_identity_error") && g_replay.epoch == epoch &&
+          atomic_load(&g_sc_btn) == DM_BTN_A && steps[0].at == 0, "invalid world installation preserves current replay and unre-based input"); free(steps);
+    camera_test_init(&fixture); test_install_world("f0:A+L1/0~f20", &camera, 0); test_input(1102);
+    dm_input_set(DM_BTN_B, 400, 0, 0, 0); fixture.rotation[0] = NAN;
+    CHECK(test_input(1103) == 0 && !strcmp(g_replay.reason, "camera_basis_error") && !atomic_load(&g_sc_axes) &&
+          !atomic_load(&g_sc_latch) && atomic_load(&g_btn) == DM_BTN_B, "bad camera stops scripted input and preserves physical input");
+    uint32_t health = 10; camera_test_init(&fixture);
+    test_install_world("f0:A~f20", &camera, (uint64_t)(uintptr_t)&health); test_input(1104); epoch = g_replay.epoch;
+    health = 0; fixture.tag ^= 1;
+    CHECK(test_input(1105) == 0 && !strcmp(g_replay.reason, "death") && g_replay.last_health == 0 &&
+          g_replay.stop_frame == 1105 && g_replay.epoch == epoch, "health death wins over simultaneous camera failure");
+    health = 10; camera_test_init(&fixture);
+    test_install_world("f0:X~f20", &camera, (uint64_t)(uintptr_t)&health); test_input(1106); epoch = g_replay.epoch;
+    CHECK(dm_replay_terminal(epoch, (uint64_t)(uintptr_t)&health, 10, 0) && !strcmp(g_replay.reason, "death") &&
+          !atomic_load(&g_sc_axes), "native terminal release works with world mode");
+    mach_vm_address_t page = 0;
+    CHECK(mach_vm_allocate(mach_task_self(), &page, 4096, VM_FLAGS_ANYWHERE) == KERN_SUCCESS, "allocate camera test page");
+    if (page) {
+        camera_test_init(&fixture); memcpy((void *)(uintptr_t)page, fixture.rotation, sizeof fixture.rotation);
+        camera.rotation_address = page; test_install_world("f0:A~f10", &camera, 0); test_input(1107);
+        CHECK(mach_vm_deallocate(mach_task_self(), page, 4096) == KERN_SUCCESS, "unmap camera test page");
+        CHECK(test_input(1108) == 0 && !strcmp(g_replay.reason, "camera_read_error"), "invalidated camera mapping stops without direct dereference");
+    }
+    camera = camera_test_init(&fixture); test_install_world("f0:A~f10", &camera, 0); test_input(1109);
+    fixture.self ^= 1;
+    CHECK(test_input(1110) == 0 && !strcmp(g_replay.reason, "camera_identity_error"), "changed active camera binding stops replay");
+    replay_test_stop(); dm_input_set(0, 0, 0, 0, 0); atomic_store(&g_latch, 0); atomic_store(&g_peek_latch, 0);
 }
 static void t_replay_health(void) {
     uint32_t health = 6; test_frame = 600;
@@ -133,12 +312,13 @@ static void t_replay_health(void) {
     CHECK(test_input(606) == 0 && !strcmp(g_replay.reason, "death"), "already dead state never presses");
 }
 static void test_terminal_rejected(uint64_t epoch, uint64_t address, uint32_t old_health, uint32_t new_health, const char *why) {
-    replay_state before; memcpy(&before, &g_replay, sizeof before);
+    unsigned char before[sizeof g_replay], after[sizeof g_replay]; memcpy(before, &g_replay, sizeof before);
     int active = atomic_load(&g_replay_on), down = touch_down, downs = touch_downs;
     uint64_t buttons = atomic_load(&g_sc_btn), axes = atomic_load(&g_sc_axes);
     uint64_t latch = atomic_load(&g_sc_latch), peek = atomic_load(&g_sc_peek_latch);
     CHECK(!dm_replay_terminal(epoch, address, old_health, new_health), why);
-    CHECK(!memcmp(&before, &g_replay, sizeof before) && atomic_load(&g_replay_on) == active &&
+    memcpy(after, &g_replay, sizeof after);
+    CHECK(!memcmp(before, after, sizeof before) && atomic_load(&g_replay_on) == active &&
           atomic_load(&g_sc_btn) == buttons && atomic_load(&g_sc_axes) == axes &&
           atomic_load(&g_sc_latch) == latch && atomic_load(&g_sc_peek_latch) == peek &&
           touch_down == down && touch_downs == downs, "rejected terminal preserves replay and scripted input");
@@ -284,6 +464,37 @@ static void t_replay_protocol(void) {
     CHECK(!rmdir(blocked), "remove ACK failure target");
     unlink(fifo); unlink(timeline); unlink(request); unlink(ack);
 }
+static void t_replay_world_protocol(void) {
+    char timeline[PATH_MAX], ack[PATH_MAX], command[PATH_MAX * 3], option[256], expected[160];
+    snprintf(timeline, sizeof timeline, "%s/world-timeline", replay_test_dir);
+    snprintf(ack, sizeof ack, "%s/world-ack", replay_test_dir);
+    test_write(timeline, "f0:L1/0+A~f8");
+    camera_fixture fixture; replay_camera camera = camera_test_init(&fixture); uint32_t health = 10;
+    snprintf(option, sizeof option, "world_xz=%llx:%llx:%llx:%llx:%llx",
+             (unsigned long long)camera.rotation_address, (unsigned long long)camera.guard1_address,
+             (unsigned long long)camera.guard1_value, (unsigned long long)camera.guard2_address, (unsigned long long)camera.guard2_value);
+    test_frame = 1200; snprintf(command, sizeof command, "replay %s %s %s health=%llx:0", timeline, ack, option, (unsigned long long)(uintptr_t)&health);
+    char *json = test_command(command, ack);
+    snprintf(expected, sizeof expected, "\"rotation_address\":\"0x%llx\",\"guard1_address\":\"0x%llx\"", (unsigned long long)camera.rotation_address, (unsigned long long)camera.guard1_address);
+    CHECK(json && strstr(json, "\"ok\":true") && strstr(json, "\"left_stick_space\":\"world_xz\"") && strstr(json, expected) &&
+          strstr(json, "\"last_camera_frame\":0"), "world start ACK reports exact binding and no transformed frame"); free(json);
+    test_input(1201); snprintf(command, sizeof command, "replay_status %s", ack); json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"last_camera_frame\":1201"), "world status ACK reports actual native camera frame"); free(json);
+    snprintf(command, sizeof command, "replay %s %s health=%llx:0 %s", timeline, ack, (unsigned long long)(uintptr_t)&health, option);
+    json = test_command(command, ack); CHECK(json && strstr(json, "\"ok\":true"), "world and health options accept either order"); free(json);
+    uint64_t epoch = g_replay.epoch;
+    snprintf(command, sizeof command, "replay %s %s %s %s", timeline, ack, option, option);
+    json = test_command(command, ack); CHECK(json && strstr(json, "\"error\":\"command_syntax\"") && g_replay.epoch == epoch, "duplicate world option rejected atomically"); free(json);
+    snprintf(command, sizeof command, "replay %s %s health=4:0 health=8:0", timeline, ack);
+    json = test_command(command, ack); CHECK(json && strstr(json, "\"error\":\"command_syntax\"") && g_replay.epoch == epoch, "duplicate health option rejected atomically"); free(json);
+    snprintf(command, sizeof command, "replay %s %s world_xz=1:2:3:4:5", timeline, ack);
+    json = test_command(command, ack); CHECK(json && strstr(json, "\"error\":\"camera_syntax\"") && g_replay.epoch == epoch, "invalid world binding rejected before replacement"); free(json);
+    snprintf(command, sizeof command, "replay %s %s", timeline, ack);
+    json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"left_stick_space\":\"camera\"") && strstr(json, "\"world_xz\":null") && strstr(json, "\"last_camera_frame\":0"),
+          "default ACK explicitly reports camera-relative mode"); free(json);
+    replay_test_stop(); unlink(timeline); unlink(ack);
+}
 static _Atomic int replay_stress_stop;
 static void *replay_reader_thread(void *arg) {
     (void)arg;
@@ -292,11 +503,14 @@ static void *replay_reader_thread(void *arg) {
 }
 static void t_replay_threads(void) {
     replay_test_stop(); test_frame = 10000; atomic_store(&replay_stress_stop, 0);
+    camera_fixture fixture; replay_camera camera = camera_test_init(&fixture);
     pthread_t reader; int started = !pthread_create(&reader, NULL, replay_reader_thread, NULL);
     CHECK(started, "concurrent native HID reader starts"); if (!started) return;
     for (int i = 0; i < 1000; i++) {
         size_t n; const char *error = NULL; replay_step *steps = test_parse("f0:A~f2 f2:X~f2", &n, &error);
-        if (!steps || (error = replay_install(steps, n, 0, 0))) { free(steps); CHECK(0, "concurrent replay replacement"); break; }
+        if (!steps || (error = replay_install(steps, n, 0, 0, i & 1 ? &camera : NULL))) { free(steps); CHECK(0, "concurrent replay replacement"); break; }
+        // Make the first step due without racing the fixture's non-atomic clock.
+        pthread_mutex_lock(&g_sync_mu); --g_replay.start; --g_replay.steps[0].at; pthread_mutex_unlock(&g_sync_mu);
         if (i & 1) replay_test_stop();
     }
     atomic_store(&replay_stress_stop, 1); CHECK(!pthread_join(reader, NULL), "concurrent native reader joins");
@@ -316,7 +530,7 @@ static void t_replay_large(void) {
 int main(void) {
     int baseline = hid_baseline_main();
     strcpy(replay_test_dir, "/tmp/nxnative-replay-test-XXXXXX"); CHECK(mkdtemp(replay_test_dir) != NULL, "temporary protocol directory");
-    t_replay_parse(); t_replay_frames(); t_replay_health(); t_replay_terminal(); t_replay_terminal_restore(); t_replay_protocol(); t_replay_threads(); t_replay_large();
+    t_replay_parse(); t_replay_frames(); t_replay_world_parse(); t_replay_world_math(); t_replay_world_frames(); t_replay_world_failures(); t_replay_health(); t_replay_terminal(); t_replay_terminal_restore(); t_replay_protocol(); t_replay_world_protocol(); t_replay_threads(); t_replay_large();
     replay_test_stop(); free(g_replay.steps); g_replay.steps = NULL;
     CHECK(!rmdir(replay_test_dir), "remove protocol directory without leftovers");
     printf("hid + native replay: %d checks, %d failed\n", checks, fails); return baseline || fails != 0;

@@ -318,6 +318,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `make -C dm/host/tests GAME=<id> replay` covers the existing HID baseline, parsing, replacement, cancellation, death/read errors, observations and concurrent HID/replay use. Python tests verify chunking, exact death-frame scoring, recovery and persistent many-gene evolution. Live speed and accelerated-clock fidelity require separate measurements.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), during checkpoint-based navigation training on macOS.
 
+### Repeated movement genes follow a changing camera
+
+- **Symptom:** identical native input chromosomes diverge after player-only checkpoint restores, even when the starting position matches.
+- **Cause:** left-stick values are camera-relative and the reset retains camera auto-follow state. Applying a transform only at a segment boundary also becomes stale during a held gene.
+- **Fix:** opt-in `world_xz` replay binds a nine-float camera-to-world matrix and two generic uint64 identity guards. Under the existing HID mutex, the host safely rereads the binding once per guest frame and solves its horizontal basis for scripted left axes. Button/touch transitions remain segment-based; camera-relative default, physical input, right stick, health terminal checks and epochs retain their behavior. Read, identity or basis errors release scripted input. See [world-direction movement genes](../evolution.md#world-direction-movement-genes) for the schema and limits.
+- **Check:** native replay tests exercise yaw/pitch, per-frame changes inside a hold, invalid bindings, terminal precedence and physical input. The Python adapter verifies the exact ACK and excludes the option from UI recovery. Camera actor identity does not prove active-camera selection in a cutscene; full-matrix reads are not atomic scene snapshots.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), where four pairs of the same genome began within 0.032 world units but separated by 1.33–13.63 units after about 120 frames. Their starting camera yaw differed by 10.38–157.17 degrees; continuously evolving hazards remain another source of variation.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

@@ -218,10 +218,16 @@ static char *keys_file(const char *path) {
 // then replace the current replay under g_sync_mu; the game never sees a partial list.
 // This vector is separate from DM_KEYS, whose seconds thread owns g_steps until exit.
 typedef struct { uint64_t at, end; key_step input; } replay_step;
+// Optional generic camera binding: two caller-supplied identity words and a
+// row-major rotation matrix. The host owns no game offsets or camera discovery.
+typedef struct {
+    uint64_t rotation_address, guard1_address, guard1_value, guard2_address, guard2_value;
+} replay_camera;
 typedef struct {
     replay_step *steps; size_t count, next; int64_t applied;
     uint64_t epoch, start, end, last_frame, stop_frame, guard_address;
     uint32_t guard_threshold, last_health; int health_valid;
+    replay_camera camera; uint64_t camera_frame; float camera_basis[4];
     const char *reason;
 } replay_state;
 static replay_state g_replay = {.applied = -1, .reason = "idle"};
@@ -313,6 +319,36 @@ static int replay_read(uint64_t address, size_t size, void *out) {
     return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)address, (mach_vm_size_t)size,
                                  (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == size;
 }
+// Read identities around the matrix copy. These safe reads do not promise an
+// atomic game snapshot; invalid or singular observations stop before input use.
+static const char *replay_camera_read(const replay_camera *camera, float basis[4]) {
+    uint64_t first, second; float r[9];
+    if (!replay_read(camera->guard1_address, sizeof first, &first) ||
+        !replay_read(camera->guard2_address, sizeof second, &second)) return "camera_read_error";
+    if (first != camera->guard1_value || second != camera->guard2_value) return "camera_identity_error";
+    if (!replay_read(camera->rotation_address, sizeof r, r) ||
+        !replay_read(camera->guard1_address, sizeof first, &first) ||
+        !replay_read(camera->guard2_address, sizeof second, &second)) return "camera_read_error";
+    if (first != camera->guard1_value || second != camera->guard2_value) return "camera_identity_error";
+    for (int i = 0; i < 9; i++) if (!isfinite(r[i]) || fabsf(r[i]) > 1.01f) return "camera_basis_error";
+    float rn = hypotf(r[0], r[6]), fn = hypotf(r[2], r[8]);
+    if (rn < .1f || rn > 1.01f || fn < .1f || fn > 1.01f) return "camera_basis_error";
+    basis[0] = r[0] / rn; basis[1] = r[6] / rn;
+    basis[2] = -r[2] / fn; basis[3] = -r[8] / fn;
+    if (fabsf(basis[0] * basis[3] - basis[1] * basis[2]) < .01f) return "camera_basis_error";
+    return NULL;
+}
+static int replay_world_axes(const key_step *step, const float basis[4], int32_t *lx, int32_t *ly) {
+    float wx = step->lx / 32767.f, wz = step->ly / 32767.f;
+    float det = basis[0] * basis[3] - basis[1] * basis[2];
+    float x = (wx * basis[3] - wz * basis[2]) / det;
+    float y = (basis[0] * wz - basis[1] * wx) / det;
+    if (!isfinite(x) || !isfinite(y)) return 0;
+    float length = fmaxf(1.f, hypotf(x, y));
+    *lx = (int32_t)lrintf(x / length * 32767.f);
+    *ly = (int32_t)lrintf(y / length * 32767.f);
+    return 1;
+}
 // Only the scripted latches are cleared; physical keyboard/controller edges stay intact.
 static void replay_release(void) {
     script_set(0, 0, 0, 0, 0); atomic_store(&g_sc_latch, 0); atomic_store(&g_sc_peek_latch, 0); dm_touch_script(NULL, 0);
@@ -388,16 +424,30 @@ static int replay_sync(void) {
     int64_t selected = g_replay.applied;
     while (g_replay.next < g_replay.count && g_replay.steps[g_replay.next].at <= frame) selected = (int64_t)g_replay.next++;
     if (selected >= 0 && g_replay.steps[selected].end <= frame) selected = -1;
-    if (selected != g_replay.applied) {
-        if (selected < 0) replay_release();
-        else {
-            const key_step *s = &g_replay.steps[selected].input;
+    int camera_updated = 0;
+    if (g_replay.camera.rotation_address && frame >= g_replay.start && frame != g_replay.camera_frame) {
+        const char *error = replay_camera_read(&g_replay.camera, g_replay.camera_basis);
+        if (error) { replay_stop_locked(error); goto done; }
+        g_replay.camera_frame = frame; camera_updated = 1;
+    }
+    int changed = selected != g_replay.applied;
+    if (selected >= 0 && (changed || camera_updated)) {
+        const key_step *s = &g_replay.steps[selected].input;
+        int32_t lx = s->lx, ly = s->ly;
+        if (g_replay.camera.rotation_address && !replay_world_axes(s, g_replay.camera_basis, &lx, &ly)) {
+            replay_stop_locked("camera_basis_error"); goto done;
+        }
+        if (changed) {
             if (s->tap) { dm_touch touch = {0, s->tx, s->ty}; dm_touch_script(&touch, 1); }
             else if (g_replay.applied >= 0 && g_replay.steps[g_replay.applied].input.tap) dm_touch_script(NULL, 0);
-            script_set(s->btn, s->lx, s->ly, s->rx, s->ry);
+            script_set(s->btn, lx, ly, s->rx, s->ry);
+        } else {
+            // A held world direction follows the camera without generating button
+            // edges, repeating touch presses, or modifying physical input paths.
+            atomic_store(&g_sc_axes, pack(lx, ly, s->rx, s->ry));
         }
-        g_replay.applied = selected;
-    }
+    } else if (changed) replay_release();
+    g_replay.applied = selected;
 done:
     pthread_mutex_unlock(&g_sync_mu); return 1;
 }
@@ -413,6 +463,16 @@ static void replay_json(FILE *f, const char *error) {
             (unsigned long long)g_replay.guard_address, g_replay.guard_threshold);
     if (g_replay.health_valid) fprintf(f, "%u", g_replay.last_health); else fputs("null", f);
     fprintf(f, ",\"stop_frame\":%llu", (unsigned long long)g_replay.stop_frame);
+    const replay_camera *camera = &g_replay.camera;
+    fprintf(f, ",\"left_stick_space\":\"%s\",\"world_xz\":", camera->rotation_address ? "world_xz" : "camera");
+    if (camera->rotation_address) {
+        fprintf(f, "{\"rotation_address\":\"0x%llx\",\"guard1_address\":\"0x%llx\",\"guard1_value\":\"0x%llx\",\"guard2_address\":\"0x%llx\",\"guard2_value\":\"0x%llx\"}",
+                (unsigned long long)camera->rotation_address, (unsigned long long)camera->guard1_address,
+                (unsigned long long)camera->guard1_value, (unsigned long long)camera->guard2_address,
+                (unsigned long long)camera->guard2_value);
+    } else fputs("null", f);
+    fprintf(f, ",\"last_camera_frame\":%llu", (unsigned long long)
+            (camera->rotation_address && g_replay.camera_frame != UINT64_MAX ? g_replay.camera_frame : 0));
     pthread_mutex_unlock(&g_sync_mu);
 }
 // Reserve an adjacent temporary before mutating input. Rename publishes complete JSON.
@@ -434,18 +494,35 @@ static const char *replay_guard(char *spec, uint64_t *address, uint32_t *thresho
         !replay_uint(colon + 1, 10, &value) || value > UINT32_MAX) return "guard_syntax";
     *threshold = (uint32_t)value; return NULL;
 }
-static const char *replay_install(replay_step *steps, size_t count, uint64_t address, uint32_t threshold) {
+static const char *replay_camera_parse(char *spec, replay_camera *camera) {
+    if (strncmp(spec, "world_xz=", 9)) return "camera_syntax";
+    char *tail = spec + 9; uint64_t values[5];
+    for (int i = 0; i < 5; i++) {
+        char *field = strsep(&tail, ":");
+        if (!field || !replay_uint(field, 16, &values[i])) return "camera_syntax";
+    }
+    if (tail || !values[0] || (values[0] & 3) || values[0] > UINT64_MAX - 9 * sizeof(float) ||
+        !values[1] || (values[1] & 7) || values[1] > UINT64_MAX - sizeof(uint64_t) ||
+        !values[3] || (values[3] & 7) || values[3] > UINT64_MAX - sizeof(uint64_t)) return "camera_syntax";
+    *camera = (replay_camera){values[0], values[1], values[2], values[3], values[4]};
+    return NULL;
+}
+static const char *replay_install(replay_step *steps, size_t count, uint64_t address, uint32_t threshold,
+                                  const replay_camera *camera) {
     const char *error = NULL;
     pthread_mutex_lock(&g_sync_mu);
     uint64_t frame = dm_guest_frame();
     if (atomic_load_explicit(&g_legacy_keys_on, memory_order_acquire)) error = "legacy_seconds_active";
     else if (frame == UINT64_MAX || steps[count - 1].end > UINT64_MAX - (frame + 1) || g_replay.epoch == UINT64_MAX) error = "frame_overflow";
-    else {
+    float basis[4];
+    if (!error && camera) error = replay_camera_read(camera, basis);
+    if (!error) {
         uint64_t base = frame + 1, epoch = g_replay.epoch + 1;
         for (size_t i = 0; i < count; i++) { steps[i].at += base; steps[i].end += base; }
         atomic_store(&g_sync_on, 0); g_sync_held = 0; replay_release(); free(g_replay.steps);
         g_replay = (replay_state){.steps = steps, .count = count, .applied = -1, .epoch = epoch, .start = base,
-            .end = steps[count - 1].end, .last_frame = UINT64_MAX, .guard_address = address, .guard_threshold = threshold, .reason = "running"};
+            .end = steps[count - 1].end, .last_frame = UINT64_MAX, .guard_address = address, .guard_threshold = threshold,
+            .camera = camera ? *camera : (replay_camera){0}, .camera_frame = UINT64_MAX, .reason = "running"};
         atomic_store_explicit(&g_replay_on, 1, memory_order_release);
     }
     pthread_mutex_unlock(&g_sync_mu); return error;
@@ -475,17 +552,21 @@ static int replay_command(char *line) {
     if ((!run && !observe && !cancel && !status) || argc <= ack_index) { LOG("[RED] DM_CTL: malformed replay command"); return 1; }
     const char *ack = args[ack_index], *error = NULL; char tmp[PATH_MAX];
     FILE *out = replay_ack_open(ack, tmp); if (!out) { LOG("[RED] DM_CTL replay: cannot create ACK %s", ack); return 1; }
-    size_t expected = run ? (argc == 4 ? 4 : 3) : observe ? 3 : 2;
-    if (argc != expected) error = "command_syntax";
+    if (run ? (argc < 3 || argc > 5) : argc != (observe ? 3 : 2)) error = "command_syntax";
     uint64_t accepted_epoch = 0;
     replay_observation reads[REPLAY_READS_MAX]; size_t nreads = 0;
     if (!error && run) {
-        uint64_t address = 0; uint32_t threshold = 0;
-        if (argc == 4) error = replay_guard(args[3], &address, &threshold);
+        uint64_t address = 0; uint32_t threshold = 0; replay_camera camera = {0};
+        int have_guard = 0, have_camera = 0;
+        for (size_t i = 3; !error && i < argc; i++) {
+            if (!strncmp(args[i], "health=", 7) && !have_guard++) error = replay_guard(args[i], &address, &threshold);
+            else if (!strncmp(args[i], "world_xz=", 9) && !have_camera++) error = replay_camera_parse(args[i], &camera);
+            else error = "command_syntax";
+        }
         if (!error && args[1][0] != '/') error = "path_syntax";
         char *text = error ? NULL : replay_file(args[1], REPLAY_FILE_MAX, &error);
         size_t count = 0; replay_step *steps = text ? replay_parse(text, &count, &error) : NULL; free(text);
-        if (steps) { error = replay_install(steps, count, address, threshold); if (error) free(steps); else accepted_epoch = g_replay.epoch; }
+        if (steps) { error = replay_install(steps, count, address, threshold, have_camera ? &camera : NULL); if (error) free(steps); else accepted_epoch = g_replay.epoch; }
     } else if (!error && cancel) {
         pthread_mutex_lock(&g_sync_mu); if (atomic_load(&g_replay_on)) replay_stop_locked("cancelled"); pthread_mutex_unlock(&g_sync_mu);
     } else if (!error && observe) {
@@ -546,8 +627,9 @@ void hid_keys_init(void) {
 //   address (nvn_mtl.m dm_gfx_addr_note: its memory pool, a texture's storage, a recorded GPU write, the raw memory table, a sparse pool's page), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "#…" is ignored.
-//   "replay <timeline> <ack> [health=<hex-address>:<u32-threshold>]" atomically replaces a frame-only timeline, relative to current frame+1;
+//   "replay <timeline> <ack> [health=<hex-address>:<u32-threshold>] [world_xz=<rotation>:<guard1-address>:<guard1-u64>:<guard2-address>:<guard2-u64>]" replaces a timeline, relative to frame+1;
 //   entries are f<start>:<keys>~f<positive-hold>, ordered and nonoverlapping, no repeats. A blank keys field is neutral. Paths must be absolute, without whitespace.
+//   world_xz fields are hex: row-major float32[9] camera rotation, right=(r0,r6), forward=(-r2,-r8); Lx/y denotes world X/Z. Identity/matrix failures stop input.
 //   "replay_status <ack>", "replay_cancel <ack>" write atomic JSON ACKs. Guard failures release input (death / guard_read_error); legacy seconds scripts cannot coexist.
 //   "replay_observe <request> <ack>" reads lines "hex-address decimal-byte-count": at most 128 reads, 4096 bytes/read, 64 KiB total, each with hex bytes or an explicit read error.
 //   Observe is not a frozen snapshot: current_frame and observed_frame_end bracket the reads. No command writes guest memory.

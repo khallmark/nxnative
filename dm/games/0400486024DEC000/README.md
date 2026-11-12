@@ -150,6 +150,18 @@ and 114.89 ms. The first terminal-to-next-start gap was eight guest frames.
 A natural lethal cycle starting at the normal checkpoint health remains under
 observation; the diagnostic injury is not mixed into its fitness.
 
+The camera-direction calibration is supported by 110 archived walking intervals:
+projected matrix columns predict travel with median angular error 2.83 degrees,
+versus 77.72 degrees for the transposed rows. `PlayerCamera + 0x328` holds the
+nine-float camera-to-world rotation; self at `+0x168`, common actor vtable at `+0`,
+and exact name `PlayerCamera` through the pointer at `+0x260` identify the known
+actor. The vtable alone is shared with other actors. The host's optional
+[world-direction replay](../../../docs/reference/services.md#repeated-movement-genes-follow-a-changing-camera)
+can bind self and vtable while the session validates the name. No active-camera
+global was proved; this is calibrated for ordinary gameplay, not cutscenes.
+Standalone X input produced a measured 0.62-unit jump arc with unchanged health;
+A as dash and Y as attack remain unverified.
+
 This player checkpoint keeps camera, hazards, animation, random state, inventory
 and quest progress running. Session addresses need fresh discovery after a process
 restart. Original save archives remain separate and unchanged. Continuous instant
