@@ -10,6 +10,7 @@ import time
 import uuid
 from typing import Any
 from .core import BASELINE, distance, steer
+from .actors import ActorReader, ActorUnavailable
 
 
 class TrialStopped(RuntimeError):
@@ -27,6 +28,11 @@ class Bridge:
         self.control=Path(config['control']).resolve()
         if any(c.isspace() for c in str(self.root)):
             raise ValueError('DM_CTL scratch path must not contain whitespace')
+        self.actors=None
+        if config.get('actor_discovery'):
+            if not config.get('ui') or 'hazard' in config['reads']:
+                raise ValueError('Dynamic actors require UI probes and cannot duplicate fixed hazard reads')
+            self.actors=ActorReader(config['actor_discovery'],self.read_memory)
         self.lock=(self.control.parent/(self.control.name+'.evolution.lock')).open('a')
         fcntl.flock(self.lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         self.running=False
@@ -42,7 +48,38 @@ class Bridge:
         with self.control.open('a') as f:
             f.write('\n'.join(lines)+'\n')
 
-    def sample(self,keys=None,hold=.15):
+    def read_memory(self,ranges):
+        if len(ranges)>4096 or sum(ranges.values())>128*1024*1024 or any(not 0<length<=65536 or not 0<=address<2**64-length for address,length in ranges.items()):
+            raise ValueError('Invalid memory read batch')
+        paths={address:self.root/(uuid.uuid4().hex+'.bin') for address in ranges}
+        try:
+            self.send(*(f'memdump {address:x} {ranges[address]} {path}' for address,path in paths.items()))
+            deadline=time.monotonic()+5.
+            while not all(path.exists() and path.stat().st_size==ranges[address] for address,path in paths.items()):
+                if time.monotonic()>deadline:raise TrialStopped('Actor telemetry timed out')
+                time.sleep(.005)
+            return {address:path.read_bytes() for address,path in paths.items()}
+        finally:
+            for path in paths.values():path.unlink(missing_ok=True)
+
+    def with_actors(self,state):
+        if self.actors is None:return state
+        observed=self.actors.observe()
+        self.last={**state,'actors':observed,'hazard':observed['hazard']['position'] if 'hazard' in observed else None,
+                   'time':time.monotonic()}
+        return self.last
+
+    def wait_actors(self,timeout=5.):
+        deadline=time.monotonic()+timeout
+        while True:
+            state=self.sample(actors=False)
+            if not ui_matches(self.config,state,'gameplay'):raise TrialStopped('Gameplay ended while discovering actors')
+            try:return self.with_actors(state)
+            except ActorUnavailable as exc:
+                if time.monotonic()>=deadline:raise TrialStopped(str(exc)) from exc
+                time.sleep(.1)
+
+    def sample(self,keys=None,hold=.15,actors=True):
         if keys is not None and (not .05<=hold<=.5 or '\n' in keys or '~' in keys):
             raise ValueError('Input must be a single bounded press')
         specs=self.config['reads']; paths={k:self.root/(uuid.uuid4().hex+'.bin') for k in specs}
@@ -69,6 +106,12 @@ class Bridge:
                 raise TrialStopped('Invalid position/health telemetry')
             self.last=dict(time=time.monotonic(),position=result['position'],camera_rotation=result['camera_rotation'],
                            health=hp,max_health=maximum,hazard=result.get('hazard'),reads=result)
+            if self.actors is not None:
+                if not ui_matches(self.config,self.last,'gameplay'):
+                    self.actors.invalidate()
+                elif actors:
+                    try:return self.with_actors(self.last)
+                    except ActorUnavailable as exc:raise TrialStopped(str(exc)) from exc
             return self.last
         finally:
             for p in paths.values():
@@ -82,15 +125,16 @@ class Bridge:
         # Without configured UI probes, the caller must visually confirm pause.
         # Mark before dispatch so an uncertain response still triggers cleanup.
         self.running=True
-        self.sample('Plus',.15)
-        self.sample('',.3)
+        self.sample('Plus',.15,actors=False)
+        self.sample('',.3,actors=False)
         if self.config.get('ui'):
             self.wait_ui('gameplay')
+            if self.actors is not None:self.wait_actors()
 
     def wait_ui(self,name,timeout=3.):
         deadline=time.monotonic()+timeout
         while True:
-            state=self.sample()
+            state=self.sample(actors=False)
             if ui_matches(self.config,state,name):
                 return state
             if time.monotonic()>=deadline:
@@ -100,9 +144,9 @@ class Bridge:
     def pause(self):
         if self.running:
             if self.config.get('ui'):
-                state=self.sample()
+                state=self.sample(actors=False)
                 if ui_matches(self.config,state,'gameplay'):
-                    self.sample('Plus',.15)
+                    self.sample('Plus',.15,actors=False)
                     self.wait_ui('pause')
             elif self.last is not None and self.last['health']>0:
                 self.send('Plus~0.15')
@@ -190,16 +234,18 @@ class Checkpoint:
         self.verify_files()
         for index,step in enumerate(self.config['steps']):
             state=self.bridge.wait_ui(step['before'])
-            self.bridge.sample(step['keys'],step.get('hold',.15))
+            self.bridge.sample(step['keys'],step.get('hold',.15),actors=False)
             # These are measured menu animation intervals, not retries of input.
             time.sleep(step.get('settle',.3))
             state=self.bridge.wait_ui(step['after'],step.get('timeout',3.))
             self.log.write(json.dumps(dict(event='recovery_step',step=index,state=state))+'\n')
             self.log.flush()
         self.verify_files()
-        state=self.bridge.sample('',.3)
+        state=self.bridge.sample('',.3,actors=False)
         if not ui_matches(self.bridge.config,state,'gameplay') or not in_bounds(state,task) or state['health']<task['min_health'] or distance(state['position'],task['start'])>task.get('start_tolerance',.3):
             raise TrialStopped('Loaded checkpoint does not match the declared start/health')
+        if self.bridge.config.get('actor_discovery'):
+            state=self.bridge.wait_actors()
         self.log.write(json.dumps(dict(event='checkpoint_restored',state=state))+'\n')
         self.log.flush()
         return state

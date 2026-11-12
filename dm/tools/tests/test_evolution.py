@@ -184,7 +184,7 @@ class CheckpointTests(unittest.TestCase):
                 def wait_ui(self,name,*args):
                     if name=='pause':raise TrialStopped('Expected pause')
                     return {}
-                def sample(self,keys,*args):self.actions.append(keys)
+                def sample(self,keys,*args,**kwargs):self.actions.append(keys)
             bridge=FakeBridge()
             with self.assertRaises(TrialStopped):Checkpoint(bridge,io.StringIO()).restore({})
             self.assertEqual(bridge.actions,['Plus'])
@@ -196,7 +196,7 @@ class CheckpointTests(unittest.TestCase):
             class FakeBridge:
                 config=c
                 def wait_ui(self,*args):return {}
-                def sample(self,*args):return dict(position=(9,0,0),health=12,reads={'hud':[1]})
+                def sample(self,*args,**kwargs):return dict(position=(9,0,0),health=12,reads={'hud':[1]})
             task=dict(start=[0,0,0],bounds=[[-1,1]]*3,min_health=12)
             with self.assertRaisesRegex(TrialStopped,'does not match'):Checkpoint(FakeBridge(),io.StringIO()).restore(task)
 

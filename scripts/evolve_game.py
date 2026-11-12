@@ -55,7 +55,7 @@ def main():
         if any(t['kind']=='checkpoint_navigation' for t in tasks) and not config.get('recovery'):
             raise ValueError('Checkpoint curriculum requires recovery configuration')
         package=Path(__file__).resolve().parents[1]/'dm'/'tools'/'evolution'
-        implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),package/'core.py',package/'live.py'])+json.dumps(config,sort_keys=True).encode()).hexdigest()
+        implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),package/'core.py',package/'live.py',package/'actors.py'])+json.dumps(config,sort_keys=True).encode()).hexdigest()
         evolution=Evolution(args.output/'evolution.sqlite',tasks,args.population,args.repeats,implementation=implementation,
                             initial_genome=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else None)
         final=evolution.state['generation']+args.generations

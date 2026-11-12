@@ -64,7 +64,7 @@ seed and its offspring must all be evaluated again.
 
 Use `--generations 0` to continue evolving until interrupted. SIGINT/SIGTERM retains
 completed evaluations and requests pause. The host releases each input after at
-most 0.4 seconds; loss of telemetry stops further actions. Pause uses normal controller input. Configured memory predicates verify the
+most 0.4 seconds for movement and 0.5 seconds for menu steps; loss of telemetry stops further actions. Pause uses normal controller input. Configured memory predicates verify the
 result; without those predicates it remains an unverified toggle. Death, dialogue
 and engine failure can prevent it; inspect the game after an abnormal stop.
 
@@ -119,6 +119,46 @@ after physically moving away from the save position and after a failed episode.
 `recovery.jsonl` records the standalone check; training recovery events are written
 to `trajectory.jsonl`. A reload that cannot restore the anchor stops evolution;
 a measured trial result is retained even if its subsequent reset fails.
+
+## Actor discovery across scene loads
+
+An optional `actor_discovery` session profile resolves named scene actors through
+an observed handle pool. This fixes an observed loading failure: the game freed a
+boulder while keeping player addresses stable, leaving NaN position data at the
+old address. The controller now clears scene bindings in menus/loading, discovers
+the live actor after gameplay returns, and validates its handle serial, pointer,
+vtable, self pointer, name and finite position on every observation. Reused or
+freed handles trigger read-only rediscovery before the next policy decision.
+Missing required actors and duplicate matching names stop input.
+
+The profile contains:
+
+- `ranges`: allowed `[start, end)` memory ranges, with integers or hex strings.
+- `pool`: `address`, `count`, `stride`, `flags` (offset list), `mask`, `equals`,
+  `pointer` offset and `serial` offset. Handle fields are little-endian 64-bit
+  values. Every configured flag comparison must match; invalid pointers and
+  empty serial markers are excluded.
+- `object`: header `size`, expected `vtable` at offset zero, and byte offsets
+  `self`, `name` and `position`. Position is three little-endian floats; name is
+  an ASCII C string of at most 127 bytes.
+- `targets`: observation names mapped to `{ "name": "ActorName", "required": true }`.
+  The `hazard` target supplies the steering policy's obstacle position. Optional
+  absent actors produce no observation; only use optional hazards in a curriculum
+  that does not require their presence.
+
+Discovery requires configured UI probes and cannot coexist with a fixed `hazard`
+read. It is bounded to the declared ranges and 64 MiB of scan pages. Cached actor
+observations read small current headers, names and handles; discovery pages are
+not retained on disk. Loading and pause checks use the stable UI/player reads,
+so a freed scene actor cannot prevent an observed pause. After loading, required
+actors get a bounded readiness check before another trial can begin.
+
+This is scene-load recovery within a validated process/build. It does not locate
+the handle pool, player, camera, health or UI roots after a process restart. Those
+profile addresses must still be rediscovered and validated for a new session.
+A save notification also does not prove the desired start: saving before Link
+fully exits a crawl can restore the last standing position on the other side.
+Always verify the actual loaded position before training.
 
 ## Evidence and remaining work
 
