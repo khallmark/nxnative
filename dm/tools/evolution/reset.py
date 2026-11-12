@@ -138,6 +138,36 @@ class FridaReset:
             sink['messages'].put_nowait(message)
         except (TypeError,ValueError,RecursionError,queue.Full):sink['overflow'].set()
 
+    def diagnostic(self,phase,**fields):
+        """Best-effort evidence must never replace the exception being diagnosed."""
+        try:
+            record=dict(event='fast_reset_diagnostic',phase=phase,**fields)
+            encoded=json.dumps(record,allow_nan=False)
+            if len(encoded.encode())>32768:
+                encoded=json.dumps(dict(event='fast_reset_diagnostic',phase=phase,error='diagnostic exceeds size bound'))
+            self.log.write(encoded+'\n');self.log.flush()
+        except Exception:
+            pass
+
+    def drain_diagnostics(self,phase):
+        sink=self.message_sink
+        if sink is None:return
+        for _ in range(256):
+            try:message=sink['messages'].get_nowait()
+            except queue.Empty:break
+            self.diagnostic(phase,message=message)
+
+    def capture_failure(self,nonce,error):
+        self.diagnostic('failure',nonce=nonce,error=str(error))
+        self.drain_diagnostics('before_cleanup_message')
+        if self.script is not None:
+            try:
+                snapshot=self.rpc('failure snapshot',self.script.exports_sync.snapshot,min(1.,self.timeout))
+                self.diagnostic('before_cleanup_snapshot',nonce=nonce,snapshot=snapshot)
+            except Exception as snapshot_error:
+                self.diagnostic('snapshot_error',nonce=nonce,error=str(snapshot_error))
+        self.drain_diagnostics('after_snapshot_message')
+
     def cleanup(self,unload=False):
         if self.script is None:return
         script=self.script;deadline=time.monotonic()+min(5.,self.timeout)
@@ -223,6 +253,7 @@ class FridaReset:
         messages=queue.Queue(maxsize=256);overflow=threading.Event();nonce=uuid.uuid4().hex
         self.message_sink={'messages':messages,'overflow':overflow,'count':0}
         deadline=time.monotonic()+self.timeout
+        primary_error=None
         try:
             if self.orphan_message:raise TrialStopped('Fast reset received an unexpected message while idle')
             if self.session is None:
@@ -261,16 +292,21 @@ class FridaReset:
             self.uncertain=False
             self.verified_player_checkpoint=self.prepared.config.get('mode')=='player_checkpoint'
             return payload
-        except BaseException:
-            self.failed=True
+        except BaseException as exc:
+            primary_error=exc;self.failed=True
+            self.capture_failure(nonce,exc)
             raise
         finally:
-            if self.script is not None:
-                try:self.cleanup()
-                except BaseException:
-                    self.failed=True;self.uncertain=True
-                    raise
-            self.message_sink=None
+            try:
+                if self.script is not None:self.cleanup()
+            except BaseException as cleanup_error:
+                self.failed=True;self.uncertain=True
+                self.diagnostic('cleanup_error',nonce=nonce,error=str(cleanup_error))
+                if primary_error is None:raise
+                primary_error.add_note('Fast reset cleanup also failed: '+str(cleanup_error))
+            finally:
+                self.drain_diagnostics('cleanup_message')
+                self.message_sink=None
 
     def close(self):
         try:
@@ -401,7 +437,16 @@ class LethalRecovery:
             elif self.result is not None:raise TrialStopped('Lethal recovery did not match a native death terminal')
 
     def close(self):
+        primary_error=None
         try:self.finish()
+        except BaseException as exc:
+            primary_error=exc
+            raise
         finally:
             if self.script is not None and not self.armed:
-                self.owner.native('unload lethal script',self.script.unload,min(5.,self.owner.timeout));self.script=None
+                try:
+                    self.owner.native('unload lethal script',self.script.unload,min(5.,self.owner.timeout));self.script=None
+                except BaseException as cleanup_error:
+                    self.owner.diagnostic('lethal_cleanup_error',error=str(cleanup_error))
+                    if primary_error is None:raise
+                    primary_error.add_note('Lethal script unload also failed: '+str(cleanup_error))

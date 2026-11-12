@@ -39,6 +39,8 @@ class FakeScript:
         self.owner.arm(self)
     def cancel(self):
         self.owner.events.append('cancel');return self.owner.cancel(self)
+    def snapshot(self):
+        return dict(active=True,nonce=self.nonce,diagnostics=dict(state_after=5,warp_returned=True))
 
 
 class FakeLethalScript(FakeScript):
@@ -176,6 +178,33 @@ class ResetTests(unittest.TestCase):
         with self.assertRaisesRegex(TrialStopped,'no longer available'):self.backend.restore(self.task)
         self.backend.close()
 
+    def test_primary_failure_and_packet_survive_cleanup_failure(self):
+        self.frida.arm=lambda script:script.emit('failed',error='readback never stable')
+        def fail_cancel(script):
+            script.emit('late_phase',state=5)
+            raise RuntimeError('cancel transport failed')
+        self.frida.cancel=fail_cancel
+        with self.assertRaisesRegex(TrialStopped,'readback never stable') as caught:
+            self.backend.restore(self.task)
+        self.assertIn('cancel transport failed',str(caught.exception.__notes__))
+        records=[json.loads(line) for line in self.log.getvalue().splitlines()]
+        diagnostic=[r for r in records if r['event']=='fast_reset_diagnostic']
+        snapshot=next(r for r in diagnostic if r['phase']=='before_cleanup_snapshot')
+        self.assertTrue(snapshot['snapshot']['diagnostics']['warp_returned'])
+        self.assertTrue(any(r['phase']=='cleanup_error' for r in diagnostic))
+        self.assertTrue(any(r['phase']=='cleanup_message' and r['message']['payload']['event']=='late_phase' for r in diagnostic))
+        self.assertIsNone(self.backend.message_sink)
+        self.frida.cancel=lambda script:dict(descriptor_restored=True)
+        self.backend.close()
+
+    def test_snapshot_failure_does_not_replace_original_failure(self):
+        self.frida.arm=lambda script:script.emit('failed',error='original native error')
+        with patch.object(FakeScript,'snapshot',side_effect=RuntimeError('snapshot transport failed')):
+            with self.assertRaisesRegex(TrialStopped,'original native error'):
+                self.backend.restore(self.task)
+        self.assertIn('snapshot_error',self.log.getvalue())
+        self.backend.close()
+
     def test_wrong_nonce_cannot_claim_completion(self):
         def arm(script):script.nonce='other';script.emit('restored',evidence={'engine_returned':True})
         self.frida.arm=arm
@@ -252,7 +281,7 @@ class ResetTests(unittest.TestCase):
             for _ in range(257):script.emit('phase')
         self.frida.arm=arm
         with self.assertRaisesRegex(TrialStopped,'message budget'):self.backend.restore(self.task)
-        self.backend.close();self.assertEqual(self.log.getvalue(),'')
+        self.backend.close();self.assertIn('message budget exceeded',self.log.getvalue())
 
 
     def enable_player_checkpoint(self):
@@ -448,7 +477,7 @@ HEADER = r'''
 typedef int gint; typedef unsigned int guint; typedef uint32_t guint32;
 typedef uint64_t guint64; typedef uint8_t guint8; typedef size_t gsize;
 typedef void *gpointer; typedef const void *gconstpointer;
-typedef struct { uint64_t sp; } GumCpuContext;
+typedef struct { uint64_t sp; uint64_t x[29]; } GumCpuContext;
 typedef struct { void *function; GumCpuContext *cpu_context; unsigned claimed; } GumInvocationContext;
 void *gum_invocation_context_get_listener_invocation_data(GumInvocationContext *, size_t);
 unsigned int gum_invocation_context_get_thread_id(GumInvocationContext *);
@@ -469,6 +498,7 @@ static void *slots[4];
 static guint64 current_frame;
 static int warp_count, race_mirror, change_tls;
 static int readonly_health;
+static int action_count, action_failure, action_bad_selection, action_bad_tls, action_cancel;
 guint32 task_self_port=123;
 gint region_info(guint32 task, guint64 *address, guint64 *size,
                  gint flavor, gint *info, guint32 *count, guint32 *object) {
@@ -481,6 +511,7 @@ gint port_deallocate(guint32 task, guint32 object) {
 }
 static guint8 player_data[0x400], life_data[0x1cb0], table_data[88*8];
 static guint64 hp_data[2], max_data[2], hud_data[64], plus_data[64];
+static guint8 bsa_data[0x1c8], action_data[0x80];
 void *gum_invocation_context_get_listener_invocation_data(GumInvocationContext *ic, size_t n) {
   (void)n; return &ic->claimed;
 }
@@ -495,9 +526,35 @@ gint test_setspecific(gsize key, gconstpointer value) { slots[key]=(void *)value
 unsigned char native_cas(gint old, gint value, volatile gint *address) {
   return __sync_bool_compare_and_swap(address,old,value);
 }
+gint action_guest(gpointer bsa, const void *request, guint32 flags) {
+  const guint32 *words=request;
+  const guint64 *wide=request;
+  guint i;
+  assert(bsa==bsa_data && flags==1 && packet.diagnostic_phase==17);
+  for(i=0;i!=24;++i) {
+    guint32 expected=0;
+    if(i==0 || i==3 || i==6 || i==11 || i==12) expected=0x7fc00000;
+    if(i==9) expected=4;
+    if(i==10) expected=0x11a;
+    if(i==13) expected=0x10;
+    if(i==19) expected=40;
+    assert(words[i]==expected);
+  }
+  assert(wide[11]==0);
+  ++action_count;
+  *(guint32 *)(action_data+0x4c)=40;
+  *(guint32 *)(action_data+0x28)=action_bad_selection ? 41 : 0x11a;
+  slots[g_key18]=(void *)0xface;
+  if(action_bad_tls) slots[g_keytls]=(void *)0xbad;
+  if(action_cancel) { cancel_pending(); assert(packet.state==6); }
+  return action_failure;
+}
 void warp_guest(gpointer actor, const float *matrix, guint32 flags) {
   guint i;
-  assert(actor==player_data && flags==0); ++warp_count;
+  assert(actor==player_data && flags==0);
+  assert(packet.diagnostic_phase==5 && packet.warp_called && !packet.warp_returned);
+  if(packet.action_enabled) assert(action_count==1 && packet.action_context_restored && slots[g_key18]==(void *)0xabcd);
+  ++warp_count;
   for(i=0;i!=3;++i) ((float *)(player_data+0x31c))[i]=matrix[i*4+3];
   for(i=0;i!=9;++i) ((float *)(player_data+0x328))[i]=matrix[(i/3)*4+i%3];
   slots[g_key18]=(void *)0xbeef;
@@ -508,6 +565,7 @@ static void initialize(void) {
   memset(&packet,0,sizeof(packet)); memset(player_data,0,sizeof(player_data));
   memset(life_data,0,sizeof(life_data)); memset(table_data,0,sizeof(table_data));
   memset(hud_data,0,sizeof(hud_data)); memset(plus_data,0,sizeof(plus_data));
+  memset(bsa_data,0,sizeof(bsa_data)); memset(action_data,0,sizeof(action_data));
   packet.player=(guint64)(gsize)player_data; packet.player_vtable=0x123456;
   packet.components=(guint64)(gsize)table_data; packet.life=(guint64)(gsize)life_data;
   packet.hp_record=(guint64)(gsize)hp_data; packet.max_record=(guint64)(gsize)max_data;
@@ -516,6 +574,12 @@ static void initialize(void) {
   *(guint64 *)(player_data+0x168)=packet.player;
   *(guint64 *)(player_data+0x270)=packet.components;
   *(guint64 *)(table_data+87*8)=packet.life;
+  packet.action_bsa=(guint64)(gsize)bsa_data; packet.action_bsa_vtable=0x888;
+  packet.action_slot0=(guint64)(gsize)action_data;
+  *(guint64 *)(table_data+0x188)=packet.action_bsa;
+  *(guint64 *)bsa_data=packet.action_bsa_vtable;
+  *(guint64 *)(bsa_data+0x18)=packet.player;
+  *(guint64 *)(bsa_data+0x1c0)=packet.action_slot0;
   *(guint64 *)life_data=packet.life_vtable;
   *(guint64 *)(life_data+0x18)=packet.player;
   *(guint64 *)(life_data+0x1c10)=packet.hp_record;
@@ -536,11 +600,18 @@ static void initialize(void) {
   slots[2]=(void *)0x111; slots[3]=(void *)0x222;
   dm_gate_top[0]=0x100000000ULL;
   current_frame=100; warp_count=race_mirror=change_tls=readonly_health=0;
+  action_count=action_failure=action_bad_selection=action_bad_tls=action_cancel=0;
 }
 static void tick(void) {
   GumCpuContext cpu; GumInvocationContext ic;
   cpu.sp=(guint64)(gsize)&cpu & ~15ULL;
   ic.function=(void *)0x778899; ic.cpu_context=&cpu; ic.claimed=0;
+  if(packet.action_enabled && packet.mode==2 && packet.state==1) {
+    // Main must not run the action before the actor's normal slot-clear phase.
+    on_enter(&ic); assert(!ic.claimed && packet.state==1);
+    cpu.x[20]=packet.player; cpu.x[24]=packet.action_bsa;
+    on_action_enter(&ic);
+  }
   on_enter(&ic); on_leave(&ic);
 }
 int main(void) {
@@ -548,12 +619,37 @@ int main(void) {
   assert(packet.state==3 && !packet.error && !warp_count && hp_data[1]==4);
   packet.mode=2; packet.state=1; tick();
   assert(packet.state==5 && packet.stable_count==1 && warp_count==1);
+  assert(packet.warp_returned && packet.diagnostic_phase==14 && packet.readback_count==1 && packet.last_readback_stable);
   assert(hp_data[1]==10 && *(guint32 *)(life_data+0x1ca8)==10);
   assert(packet.health_written && slots[0]==(void *)0xabcd);
   tick(); assert(packet.stable_count==1 && warp_count==1);
   ++current_frame; tick(); assert(packet.state==5 && packet.stable_count==2);
   ++current_frame; tick(); assert(packet.state==3 && packet.stable_count==3);
   assert(packet.first_stable_frame==100 && packet.last_sample_frame==102);
+  assert(packet.diagnostic_phase==15 && packet.readback_count==4 && packet.last_readback_stable);
+  assert(packet.post_warp_captured && packet.post_warp_position[0]==1 && packet.post_warp_rotation[0]==1);
+  assert(packet.first_readback_captured && packet.first_readback_frame==100);
+  assert(packet.first_readback_position[0]==1 && packet.first_readback_rotation[0]==1);
+  assert(packet.first_readback_health==10 && packet.first_readback_mirror==10);
+  assert(packet.first_readback_stable && !packet.first_readback_error);
+  initialize(); {
+    GumCpuContext cpu; GumInvocationContext ic;
+    cpu.sp=(guint64)(gsize)&cpu & ~15ULL;
+    ic.function=(void *)0x778899; ic.cpu_context=&cpu; ic.claimed=0;
+    on_enter(&ic);
+    // Simulate the original selector overwriting the just-warped pose.
+    ((float *)(player_data+0x31c))[0]=99;
+    ((float *)(player_data+0x328))[0]=.5f;
+    on_leave(&ic);
+    assert(packet.post_warp_position[0]==1 && packet.post_warp_rotation[0]==1);
+    assert(packet.first_readback_position[0]==99 && packet.first_readback_rotation[0]==.5f);
+    assert(packet.first_readback_frame==100 && !packet.first_readback_stable);
+    ++current_frame; ((float *)(player_data+0x31c))[0]=88;
+    hp_data[1]=9; *(guint32 *)(life_data+0x1ca8)=9; tick();
+    assert(packet.position_after[0]==88 && packet.health_after==9);
+    assert(packet.first_readback_position[0]==99 && packet.first_readback_health==10);
+    assert(packet.post_warp_position[0]==1 && packet.readback_count==2);
+  }
   initialize(); *(guint64 *)(life_data+0x18)=0; tick();
   assert(packet.error==8 && packet.state==3 && !warp_count && hp_data[1]==4);
   initialize(); hp_data[1]=0; tick(); assert(packet.error==8 && !warp_count);
@@ -571,6 +667,16 @@ int main(void) {
   initialize(); tick(); ++current_frame; hp_data[1]=9;
   *(guint32 *)(life_data+0x1ca8)=9; tick();
   assert(packet.state==5 && packet.stable_count==0 && warp_count==1);
+  assert(packet.diagnostic_phase==14 && packet.warp_returned && !packet.last_readback_stable && packet.readback_count==2);
+  initialize(); tick();
+  ((float *)(player_data+0x31c))[0]=99;
+  hp_data[1]=9; *(guint32 *)(life_data+0x1ca8)=9;
+  current_frame=159; tick(); assert(packet.state==5 && !packet.error);
+  current_frame=160; tick();
+  assert(packet.state==3 && packet.error==13 && packet.diagnostic_phase==15);
+  assert(warp_count==1 && hp_data[1]==9 && *(guint32 *)(life_data+0x1ca8)==9);
+  assert(packet.readback_count==3 && packet.first_readback_frame==100);
+  ++current_frame; tick(); assert(warp_count==1 && packet.readback_count==3 && hp_data[1]==9);
   initialize(); tick(); ++current_frame; ((float *)(player_data+0x328))[0]=0; tick();
   assert(packet.state==5 && packet.stable_count==0);
   initialize(); {
@@ -585,12 +691,133 @@ int main(void) {
     ic.function=(void *)0x778899; ic.cpu_context=&cpu; ic.claimed=0;
     on_enter(&ic); on_leave(&ic); assert(packet.error==3 && !warp_count);
   }
+  initialize(); packet.action_enabled=1; tick();
+  assert(action_count==1 && packet.action_called && packet.action_returned && packet.action_result==0);
+  assert(packet.action_context_restored && packet.action_selected==40 && packet.action_requested==40);
+  assert(packet.action_tid==321 && packet.action_frame==100 && packet.action_stack_delta<65536);
+  assert(warp_count==1 && !packet.error && hp_data[1]==10);
+  ++current_frame; tick(); ++current_frame; tick();
+  assert(packet.state==3 && action_count==1 && warp_count==1);
+  initialize(); packet.action_enabled=1; {
+    GumCpuContext cpu; GumInvocationContext ic;
+    cpu.sp=(guint64)(gsize)&cpu & ~15ULL; cpu.x[20]=0; cpu.x[24]=packet.action_bsa;
+    ic.function=(void *)0x778899; ic.cpu_context=&cpu; ic.claimed=0;
+    on_action_enter(&ic); assert(!ic.claimed && !action_count && packet.state==1);
+  }
+  initialize(); packet.action_enabled=1; action_data[0x7c]=2; tick();
+  assert(packet.error==15 && action_count==0 && !warp_count && hp_data[1]==4);
+  initialize(); packet.action_enabled=1; *(guint64 *)(bsa_data+0x18)=0; tick();
+  assert(packet.error==14 && action_count==0 && !warp_count);
+  initialize(); packet.action_enabled=1; action_failure=3; tick();
+  assert(packet.error==16 && action_count==1 && !warp_count && hp_data[1]==4 && slots[0]==(void *)0xabcd);
+  initialize(); packet.action_enabled=1; action_bad_selection=1; tick();
+  assert(packet.error==18 && !warp_count && hp_data[1]==4);
+  initialize(); packet.action_enabled=1; action_cancel=1; tick();
+  assert(packet.state==4 && !warp_count && hp_data[1]==4 && slots[0]==(void *)0xabcd);
+  initialize(); packet.action_enabled=1; action_bad_tls=1; tick();
+  assert(packet.error==17 && !warp_count && hp_data[1]==4 && slots[0]==(void *)0xabcd);
   puts("native checkpoint simulated-memory checks passed"); return 0;
 }
 '''
 
 
 class NativeCheckpointTests(unittest.TestCase):
+    def test_diagnostic_snapshot_is_bounded_and_does_not_run_cleanup(self):
+        node=shutil.which('node')
+        if node is None:self.skipTest('node unavailable for diagnostic snapshot test')
+        script=Path(__file__).resolve().parents[2]/'games'/'0400486024DEC000'/'player_checkpoint.js'
+        harness=r"""
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const bytes=Buffer.alloc(704);
+class Pointer {
+  constructor(offset=0){this.offset=offset;}
+  add(value){return new Pointer(this.offset+value);}
+  readS32(){return bytes.readInt32LE(this.offset);}
+  readU32(){return bytes.readUInt32LE(this.offset);}
+  readU64(){return bytes.readBigUInt64LE(this.offset);}
+  readFloat(){return bytes.readFloatLE(this.offset);}
+  readPointer(){return {isNull:()=>true};}
+}
+const fail=()=>{throw Error('snapshot invoked a native function or cleanup');};
+const actor={readPointer:()=>({equals:()=>true}),add:()=>({readPointer:()=>({equals:()=>true}),readFloat:()=>1})};
+const context={rpc:{},packet:new Pointer(),actor,NativeFunction:fail,Interceptor:{flush:fail},
+  Process:{findRangeByAddress:fail}};
+vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+vm.runInContext("active={packet,player:actor,expectedVtable:{},inactive:false,nonce:'diagnostic-test',result:null,readState:()=>{throw Error('native readState called')}}",context);
+bytes.writeInt32LE(2,0);bytes.writeUInt32LE(2,4);bytes.writeUInt32LE(5,432);
+bytes.writeUInt32LE(1,416);bytes.writeBigUInt64LE(25441n,424);
+let observed=context.rpc.exports.snapshot();
+assert.equal(observed.diagnostics.phase_name,'warp_entered');assert(observed.diagnostics.warp_called);
+assert.equal(observed.diagnostics.warp_returned,false);assert.equal(observed.diagnostics.snapshot_consistent,false);
+assert.equal(observed.diagnostics.warp_frame,'25441');assert.equal(observed.diagnostics.live_observation.atomic,false);
+bytes.writeInt32LE(5,0);bytes.writeUInt32LE(3,4);bytes.writeUInt32LE(14,432);
+bytes.writeUInt32LE(1,436);bytes.writeUInt32LE(600,440);bytes.writeUInt32LE(0,444);
+bytes.writeUInt32LE(10,332);bytes.writeUInt32LE(10,336);bytes.writeUInt32LE(3,344);
+bytes.writeFloatLE(-80.5,204);bytes.writeFloatLE(122,208);bytes.writeFloatLE(34.5,212);
+bytes.writeUInt32LE(1,568);bytes.writeUInt32LE(1,572);
+bytes.writeFloatLE(1,448);bytes.writeFloatLE(2,496);bytes.writeBigUInt64LE(25442n,544);
+bytes.writeUInt32LE(10,552);bytes.writeUInt32LE(10,556);
+const before=Buffer.from(bytes);observed=context.rpc.exports.status();
+assert.equal(observed.diagnostics.phase_name,'waiting_stability');assert(observed.diagnostics.warp_returned);
+assert.equal(observed.diagnostics.readback_count,600);assert.equal(observed.diagnostics.stable_frames,0);
+assert.equal(observed.diagnostics.last_readback_stable,false);assert(observed.diagnostics.snapshot_consistent);
+assert.equal(observed.diagnostics.authoritative_health,10);assert.equal(observed.diagnostics.position_after[0],-80.5);
+assert(observed.diagnostics.post_warp.captured);assert.equal(observed.diagnostics.post_warp.position[0],1);
+assert(observed.diagnostics.first_readback.captured);assert.equal(observed.diagnostics.first_readback.position[0],2);
+assert.equal(observed.diagnostics.first_readback.frame,'25442');assert.equal(observed.diagnostics.first_readback.authoritative_health,10);
+assert(bytes.equals(before));assert(JSON.stringify(observed).length<8192);
+bytes.writeInt32LE(3,0);bytes.writeUInt32LE(15,432);
+observed=context.rpc.exports.status();assert.equal(observed.state,3);assert(observed.active);
+assert.equal(observed.descriptor_restored,false); // A snapshot never calls finish/detach.
+"""
+        result=subprocess.run([node,'-e',harness,str(script)],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_physics_snapshot_checks_chain_and_method_without_native_calls(self):
+        node=shutil.which('node')
+        if node is None:self.skipTest('node unavailable for physics snapshot test')
+        script=Path(__file__).resolve().parents[2]/'games'/'0400486024DEC000'/'player_checkpoint.js'
+        harness=r"""
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const pointers=new Map(),reads=[];
+class Pointer {
+  constructor(value){this.value=value;}
+  add(value){return new Pointer(this.value+value);}
+  equals(other){return this.value===other.value;}
+  isNull(){return this.value===0;}
+  toString(){return '0x'+this.value.toString(16);}
+  readPointer(){reads.push(this.value);return new Pointer(pointers.get(this.value)||0);}
+  readU32(){reads.push(this.value);return this.value===0x7070 ? bodyFlags : 3;}
+  readU64(){reads.push(this.value);return BigInt(this.value===0x7070 ? bodyFlags : 64);}
+  readFloat(){reads.push(this.value);return this.value;}
+}
+let bodyFlags=0;
+const base=new Pointer(0x10000000),player=new Pointer(0x1000),packet=new Pointer(0x9000);
+const entries=[[0x1270,0x2000],[0x90f8,0x2000],[0x2050,0x3000],
+ [0x3038,0x1000],[0x3020,0x4000],[0x3000,0x30000],[0x4000,0x40000],
+ [0x4190,0x7000],[0x4010,0x5000],[0x5008,0x6000],[0x6000,0xa000],
+ [0xa0c8,0x106b2330],[0x6020,0x7000],[0x7000,0x70000],[0x7060,0x8000]];
+for(const entry of entries)pointers.set(...entry);
+const fail=()=>{throw Error('snapshot performed a native call or mapping lookup');};
+const context={rpc:{},Process:{findRangeByAddress:fail},NativeFunction:fail};
+vm.createContext(context);vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
+let result=context.physicsObservation({base,player,packet});
+assert(result.available && !result.atomic && result.body_layout_verified);
+assert.equal(result.model_pending_matrix.length,12);assert.equal(result.body_pending_matrix.length,12);
+assert.equal(result.body_pending_flags,'64');assert(reads.length<100);
+bodyFlags=0x100;result=context.physicsObservation({base,player,packet});
+assert(result.body_uses_global_scratch);assert.equal(result.body_pending_matrix,undefined);
+bodyFlags=0;pointers.set(0xa0c8,0xbad);reads.length=0;
+result=context.physicsObservation({base,player,packet});
+assert(result.available && !result.body_layout_verified);assert(!reads.includes(0x7060));
+pointers.set(0x3038,0xbad);reads.length=0;result=context.physicsObservation({base,player,packet});
+assert(!result.available);assert(!reads.includes(0x4000));
+pointers.set(0x3038,0x1000);pointers.set(0x5008,0);
+result=context.physicsObservation({base,player,packet});assert(result.available);assert.equal(result.controller,'0x0');
+"""
+        result=subprocess.run([node,'-e',harness,str(script)],capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+
     def test_mapping_cache_reuses_containment_but_rejects_missing_permission(self):
         node=shutil.which('node')
         if node is None:self.skipTest('node unavailable for mapping-cache test')

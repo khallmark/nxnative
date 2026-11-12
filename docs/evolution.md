@@ -92,7 +92,11 @@ there is no controller heartbeat watchdog.
 time, frames per wall second, reset time and attempts per minute. The native
 `stop_frame` freezes terminal timing; later observation latency does not extend
 life. Memory reads are asynchronous, with start/end frame brackets reported as
-observation skew. Measure actual throughput and behavior before claiming speedup
+observation skew. A second status check reconciles the same epoch and replay
+bounds after each read. Position affects fitness only when its bracket ends
+strictly before a confirmed later active frame or terminal frame. Same-frame
+samples remain pending, so health recovery cannot turn post-death movement into
+objective progress. Measure actual throughput and behavior before claiming speedup
 from `DM_DETCLOCK` or headless mode; a fast timeline compiler is not fast gameplay.
 
 ### In-place player checkpoints
@@ -127,6 +131,13 @@ to finish before removing instrumentation. An uncertain reset also suppresses th
 runner's normal Plus-button cleanup because the screen may be transitioning.
 Ordinary Game Over recovery remains necessary unless a separately verified lethal
 damage hook has prevented entry into that flow.
+
+On reset failure, the runner retains the original exception and captures the
+profile's bounded `snapshot()` evidence before cancellation. Queued phase messages
+and cleanup failures stay in the trajectory diagnostics. Runner shutdown records
+cleanup operations and tracebacks separately in `cleanup-errors.jsonl`; those
+errors do not replace the primary failure. The snapshot is diagnostic evidence,
+not completion proof, and does not advance the reset or call guest functions.
 
 The optional top-level `native_guard_health_address` selects an aligned u32
 address for the native terminal guard independently of the `health` telemetry

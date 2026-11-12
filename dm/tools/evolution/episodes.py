@@ -52,20 +52,28 @@ class NativeEpisodes:
         scorer.observe(0,initial['position'],initial['health'])
         compiled=time.perf_counter();timeline=compile_timeline(genome,s.get('segments',128),s['horizon_frames']);compile_seconds=time.perf_counter()-compiled
         started=time.perf_counter();status=b.start_replay(timeline,self.health_address)
-        start_frame=status['start_frame'];last_frame=start_frame;last_progress=started;max_skew=0;next_log=0
+        start_frame=status['start_frame'];end_frame=status['end_frame'];epoch=status['epoch']
+        last_frame=start_frame;last_progress=started;max_skew=0;next_log=0;pending=None
         try:
             if self.reset_backend is not None:self.reset_backend.arm_episode(status,self.task,self.health_address)
             while True:
                 if self.reset_backend is not None:self.reset_backend.poll_episode()
-                state=b.sample(actors=False);status=b.native_status
-                observed_end=status.get('observed_frame_end')
-                if type(observed_end) is not int or observed_end<status['current_frame']:
+                state=b.sample(actors=False);observation=b.native_status;status=observation
+                observed_end=observation.get('observed_frame_end')
+                if type(observed_end) is not int or observed_end<observation['current_frame']:
                     raise TrialStopped('Invalid native observation frame bracket')
-                max_skew=max(max_skew,observed_end-status['current_frame'])
+                # replay_observe snapshots status before reading memory. A lethal
+                # callback can stop/heal the player inside that read bracket.
+                status=b.rpc('replay_status')
+                if any(row['epoch']!=epoch or row['start_frame']!=start_frame or row['end_frame']!=end_frame for row in (observation,status)):
+                    raise TrialStopped('Native replay identity changed during observation')
+                if status['current_frame']<observed_end:
+                    raise TrialStopped('Native status precedes its observation bracket')
+                max_skew=max(max_skew,observed_end-observation['current_frame'])
                 now=time.perf_counter()
                 if observed_end>last_frame:last_progress=now;last_frame=observed_end
                 if now-last_progress>s.get('stall_seconds',30.):raise TrialStopped('Guest frame counter stopped advancing')
-                terminal=None;health=state['health'];frame=status['current_frame']
+                terminal=None;health=state['health'];frame=observation['current_frame']
                 if not status['active']:
                     if status['reason'] not in ('death','completed'):raise TrialStopped('Native replay stopped: '+status['reason'])
                     if type(status.get('stop_frame')) is not int or status['stop_frame']<start_frame or type(status.get('last_health')) is not int:
@@ -77,12 +85,19 @@ class NativeEpisodes:
                 elif health>0 and not ui_matches(b.config,state,'gameplay'):
                     raise TrialStopped('Unexpected UI interrupted native episode')
                 relative=min(s['horizon_frames'],max(0,frame-start_frame))
-                # The guard may fire while the asynchronous reads are in flight.
-                # Wait for its terminal snapshot before counting death/survival.
-                if terminal:
-                    scorer.terminal(relative,health)
-                elif health>0 and observed_end<status['end_frame']:
-                    scorer.observe(relative,state['position'],health)
+                # Commit position only after a strictly later confirmed frame.
+                # Equality stays pending: death can still land in that same frame
+                # just after this status ACK. Keep at most the latest such sample.
+                candidate=(observation['current_frame'],observed_end,state['position'],state['health']) if observation['active'] and state['health']>0 else None
+                boundary=min(end_frame,status['stop_frame'] if terminal else status['current_frame'])
+                previous=pending;pending=None
+                for measured in (previous,candidate):
+                    if measured is None:continue
+                    measured_frame,measured_end,position,measured_health=measured
+                    if measured_end<boundary:
+                        scorer.observe(max(0,measured_frame-start_frame),position,measured_health)
+                    elif not terminal and measured_end<end_frame:pending=measured
+                if terminal:scorer.terminal(relative,health)
                 if relative>=next_log or terminal:
                     self.emit('episode_sample',frame=relative,position=state['position'],health=health,active=status['active'],reason=status['reason'])
                     next_log=relative+60

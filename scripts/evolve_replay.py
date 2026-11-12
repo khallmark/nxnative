@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import sys
 import time
+import traceback
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'dm'/'tools'))
 from evolution.core import Evolution
 from evolution.episodes import NativeEpisodes,validate_episode
@@ -44,7 +45,7 @@ def main():
                         mutation_rate=args.mutation_rate,mutation_sigma=args.mutation_sigma)
     def interrupt(signum,frame):raise KeyboardInterrupt
     signal.signal(signal.SIGTERM,interrupt)
-    bridge=None;backend=None;log=None
+    bridge=None;backend=None;log=None;primary=None;cleanup_errors=[]
     try:
         bridge=ReplayBridge(config)
         log=(args.output/'trajectory.jsonl').open('a')
@@ -70,24 +71,41 @@ def main():
             evolution.record(key,result)
             print(json.dumps(dict(event='episode_finished',key=key,**result)),flush=True)
             _,reset_seconds=env.restore()
-    except (TrialStopped,ValueError,OSError) as exc:
-        with (args.output/'interruptions.jsonl').open('a') as interruptions:
-            interruptions.write(json.dumps(dict(error=str(exc),state=bridge.last if bridge else None))+'\n')
+    except BaseException as exc:
+        primary=exc
+        if isinstance(exc,(TrialStopped,ValueError,OSError)):
+            try:
+                with (args.output/'interruptions.jsonl').open('a') as interruptions:
+                    interruptions.write(json.dumps(dict(error=str(exc),state=bridge.last if bridge else None,
+                        traceback=traceback.format_exc()))+'\n')
+            except BaseException as logging_error:
+                cleanup_errors.append(('interruptions.write',logging_error,logging_error.__traceback__))
         raise
     finally:
-        try:
-            if backend is not None:
-                try:backend.close()
-                finally:
-                    # A queued game reload may outlive failed instrumentation.
-                    # Releasing native input is safe; a Plus/menu fallback is not.
-                    if backend.uncertain and bridge is not None:bridge.running=False
-        finally:
+        def cleanup(operation,callback):
+            try:callback();return True
+            except BaseException as error:
+                cleanup_errors.append((operation,error,error.__traceback__));return False
+        if backend is not None:
+            backend_closed=cleanup('backend.close',backend.close)
+            # A failed close may leave instrumentation active even if its flag
+            # was not updated. Release native input without a Plus/menu fallback.
+            if bridge is not None and (not backend_closed or backend.uncertain):bridge.running=False
+        if bridge is not None:cleanup('bridge.close',bridge.close)
+        if log is not None:cleanup('trajectory.close',log.close)
+        cleanup('database.close',evolution.db.close)
+        for operation,error,tb in cleanup_errors:
             try:
-                if bridge is not None:bridge.close()
-            finally:
-                if log is not None:log.close()
-                evolution.db.close()
+                with (args.output/'cleanup-errors.jsonl').open('a') as errors:
+                    errors.write(json.dumps(dict(event='cleanup_error',operation=operation,error=str(error),
+                        traceback=''.join(traceback.format_exception(type(error),error,tb))))+'\n')
+            except BaseException as logging_error:
+                # Diagnostics must never replace the original failure either.
+                try:print(f'{operation} failed: {error}; cleanup log failed: {logging_error}',file=sys.stderr)
+                except BaseException:pass
+        if primary is None and cleanup_errors:
+            _,error,tb=cleanup_errors[0]
+            raise error.with_traceback(tb)
 
 
 if __name__=='__main__':

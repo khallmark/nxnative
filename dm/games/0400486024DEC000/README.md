@@ -95,12 +95,12 @@ Current, Mac only, NSO build `e0f3ccfaf50065ae4ea01eb5aeb13b1a`: the optional
 pose and health while the scene remains loaded. Its generic runner contract is in
 [the evolution guide](../../../docs/evolution.md#in-place-player-checkpoints).
 The native player/controller warp is `main+0xc6fb30`, called with a row-major
-Matrix34 and mode0 from the game-stack callback at `main+0x3303ca0`. The bridge
+Matrix34 and mode 0 from the game-stack callback at `main+0x3303ca0`. The bridge
 checks the native stack and host-gate bounds and restores virtual x18; direct
 JavaScript FFI calls into guest code are not a substitute for that bridge.
 
 The authoritative health record is reached from player components at `+0x270`,
-entry87, life component `+0x1c10`, record `+8`. The life component's `+0x1ca8`
+entry 87, life component `+0x1c10`, record `+8`. The life component's `+0x1ca8`
 value is a mirror. Ownership, vtables, pointer chain, gameplay UI and current
 writable memory are checked before health changes. The optional
 [`lethal_checkpoint.js`](lethal_checkpoint.js) observes the damage CAS at
@@ -108,21 +108,43 @@ writable memory are checked before health changes. The optional
 [atomic native terminal recovery](../../../docs/reference/threads.md#native-replay-terminal-events-before-checkpoint-restoration)
 for the exact replay epoch. Its initial preparation installs no hooks.
 
-Measured in a Kokiri Forest training session on2026-11-12: three player restores
-matched the calibrated checkpoint position/rotation and health10, with all14 save
-hashes unchanged. Repeated uncached range checks cost5.68–5.80s; an independent
-read-only benchmark found a heap `Process.findRangeByAddress` lookup cost658–673ms,
-while CModule compilation cost0–1ms. Keeping validated spans and the bridge in
-one attachment reduced initial setup plus restore to1.432s and the next two
-complete restores to72.8ms and72.0ms. The native checkpoint used three distinct
-stable frames. Normal guarded Load retries in that session cost about13.6s.
-These are checkpoint request timings, not a claim of faster game simulation.
+Measured in a Kokiri Forest training session on 2026-11-12: three player restores
+matched the calibrated checkpoint position/rotation and health 10, with all 14 save
+hashes unchanged. Repeated uncached range checks cost 5.68–5.80 s; an independent
+read-only benchmark found a heap `Process.findRangeByAddress` lookup cost 658–673 ms,
+while CModule compilation cost 0–1 ms. Keeping validated spans and the bridge in
+one attachment reduced initial setup plus restore to 1.432 s and the next two
+complete restores to 72.8 ms and 72.0 ms. The native checkpoint used three distinct
+stable frames. The actual Python adapter then verified two warm at-rest restores
+in 85.70 ms and 76.05 ms, after 8.404 s of initial preparation. Normal guarded
+Load retries in that session cost about 13.7 s. These are checkpoint request
+timings; the measured game still simulates about 60 frames per second.
 
-This is a player checkpoint, not a world/RAM snapshot: camera, hazards, animation,
-random state, inventory and quest progress continue. Session addresses need fresh
-discovery after a process restart. Original save archives remain separate and
-unchanged. Continuous automatic death recovery with this bridge remains open
-until a real lethal-damage cycle is observed. No successful chest landing, sword,
+The first natural lethal hit crossed health 1 to 0 at replay frame 25437. The
+native transaction preserved terminal health 0 and recovered live health to 10.
+The following checkpoint completed its dryrun but did not verify the saved pose;
+cleanup errors obscured the original failure. The host kept running and all 14
+save hashes stayed unchanged. Continuous training resumed with guarded Load.
+This proves terminal scoring and health recovery, not death-to-next-attempt reset.
+A second pilot verified an ordinary moving reset in 98.78 ms, then reproduced the
+lethal failure. The warp returned and restored health, but 1,323 subsequent
+readbacks never matched the checkpoint. The bridge now preserves the first
+readback, current physics state and the original error; an unstable warp fails
+after 60 guest frames instead of waiting through further damage.
+
+The opt-in `reset_action: true` candidate first requests the engine's `Wait`
+action (verb 40, slot 0) at `main+0xcba80`, after the actor update clears its
+execution flags and before scheduler evaluation. It calls `main+0xc08f0` once,
+checks acceptance and the selected action, then warps. Bind fresh `action_bsa`,
+`action_bsa_vtable` and `action_slot0` addresses and both extra code fingerprints.
+The callback verifies actor/BSA registers, ownership, the native stack and thread
+context. Main performs the subsequent stability reads. The default leaves this
+experimental action request disabled; live post-lethal acceptance remains open.
+
+This player checkpoint keeps camera, hazards, animation, random state, inventory
+and quest progress running. Session addresses need fresh discovery after a process
+restart. Original save archives remain separate and unchanged. Continuous instant
+death recovery remains under investigation. No successful chest landing, sword,
 boss or ending has been established by this training run.
 
 ## Open

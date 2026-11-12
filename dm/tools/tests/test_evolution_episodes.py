@@ -16,14 +16,22 @@ from evolution.timeline import seed_genome
 class FakeBridge:
     root: Path
     def __init__(self,rows):
-        self.rows=iter(rows);self.calls=0;self.cancelled=0;self.native_status={}
+        self.rows=iter(rows);self.calls=0;self.cancelled=0;self.status_calls=0;self.native_status={}
         self.config: dict[str,Any]=dict(recovery={'files':{}},reads={'health':{'address':'0x1000'}},ui={'gameplay':[dict(read='hud',equals=1)]})
     def sample(self,actors=False):
         self.calls+=1
         if self.calls==1:return dict(position=[0,0,0],health=10,reads={'hud':[1]})
-        self.native_status,health=next(self.rows)
-        return dict(position=[1,0,0],health=health,reads={'hud':[1]})
-    def start_replay(self,*args):self.replay_args=args;return dict(start_frame=100,epoch=7)
+        row=next(self.rows)
+        if isinstance(row,dict):
+            self.native_status=row['before'];self.after=row['after'];health=row['health'];position=row['position']
+        else:
+            self.native_status,health=row;position=[1,0,0]
+            self.after={**self.native_status,'current_frame':self.native_status['observed_frame_end']}
+        return dict(position=position,health=health,reads={'hud':[1]})
+    def rpc(self,verb):
+        assert verb=='replay_status'
+        self.status_calls+=1;self.native_status=self.after;return self.after
+    def start_replay(self,*args):self.replay_args=args;return dict(start_frame=100,end_frame=200,epoch=7)
     def cancel_replay(self):self.cancelled+=1
 
 
@@ -92,6 +100,55 @@ class EpisodeTests(unittest.TestCase):
         self.assertEqual(result['reason'],'horizon');self.assertEqual(result['alive_frames'],100)
         self.assertTrue(result['censored']);self.assertEqual(result['health'],6)
         self.assertEqual(result['progress_bin'],0);self.assertEqual(result['position'],(0,0,0))
+
+    def test_healed_postdeath_position_inside_read_bracket_is_not_credited(self):
+        for read_end in (120,122):
+            with self.subTest(read_end=read_end):
+                before={**status(119),'observed_frame_end':read_end}
+                after=status(123,False,'death',0,120)
+                result,bridge=self.run_episode([dict(before=before,after=after,health=10,position=[10,0,0])])
+                self.assertEqual(result['alive_frames'],20);self.assertEqual(result['health'],0)
+                self.assertEqual(result['progress_bin'],0);self.assertEqual(result['position'],(0,0,0))
+                self.assertFalse(result['success']);self.assertEqual(bridge.status_calls,1)
+
+    def test_death_after_active_status_in_same_frame_discards_pending_position(self):
+        first={**status(119),'observed_frame_end':119}
+        result,_=self.run_episode([
+            dict(before=first,after=first,health=10,position=[10,0,0]),
+            dict(before=status(121,False,'death',0,119),after=status(122,False,'death',0,119),health=10,position=[10,0,0])])
+        self.assertEqual(result['alive_frames'],19);self.assertEqual(result['progress_bin'],0)
+        self.assertFalse(result['success']);self.assertEqual(result['position'],(0,0,0))
+
+    def test_position_strictly_before_terminal_frame_is_preserved(self):
+        before={**status(118),'observed_frame_end':119}
+        result,_=self.run_episode([dict(before=before,after=status(122,False,'death',0,120),health=10,position=[8,0,0])])
+        self.assertEqual(result['progress_bin'],80);self.assertEqual(result['position'],(8,0,0))
+        self.assertEqual(result['health'],0);self.assertEqual(result['alive_frames'],20)
+
+    def test_pending_position_is_committed_after_later_active_frame(self):
+        first={**status(110),'observed_frame_end':110}
+        result,_=self.run_episode([
+            dict(before=first,after=first,health=10,position=[8,0,0]),
+            dict(before=status(115),after=status(117),health=9,position=[7,0,0]),
+            (status(121,False,'death',0,120),10)])
+        self.assertEqual(result['progress_bin'],80);self.assertEqual(result['position'],(7,0,0))
+        self.assertEqual(result['damage'],10)
+
+    def test_overlapping_terminal_sample_cannot_complete_stable_objective(self):
+        prior=[dict(before={**status(frame),'observed_frame_end':frame},after=status(frame+1),health=10,position=[10,0,0])
+               for frame in (110,115,118)]
+        for read_end,expected_success in [(119,True),(120,False),(122,False)]:
+            with self.subTest(read_end=read_end):
+                final=dict(before={**status(119),'observed_frame_end':read_end},after=status(123,False,'death',0,120),health=10,position=[10,0,0])
+                result,_=self.run_episode(prior+[final])
+                self.assertEqual(result['success'],expected_success)
+                self.assertEqual(result['progress_bin'],100 if expected_success else 99)
+
+    def test_reconciliation_rejects_epoch_change_and_frame_regression(self):
+        before=status(119)
+        for after in [{**status(122),'epoch':8},status(119)]:
+            with self.subTest(after=after),self.assertRaises(TrialStopped):
+                self.run_episode([dict(before=before,after=after,health=10,position=[10,0,0])])
 
     def test_guard_errors_never_receive_fitness(self):
         for reason in ('guard_read_error','cancelled','frame_regression'):
