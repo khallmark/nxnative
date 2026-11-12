@@ -7,7 +7,7 @@ import unittest
 from typing import Any
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from evolution.core import Evolution, BASELINE, closest_approach, steer
-from evolution.live import LiveTrials, TrialStopped
+from evolution.live import LiveTrials, TrialStopped, validate_tasks
 
 TASKS=[{'id':'a'},{'id':'b'}]
 
@@ -75,6 +75,17 @@ class EvolutionTests(unittest.TestCase):
                     e.record(key,dict(score=score,success=True))
                 best.append(e.advance()['fitness'])
             self.assertGreater(best[-1],best[0]+.2)
+
+
+class CurriculumTests(unittest.TestCase):
+    def test_rejects_incomplete_or_nonfinite_safeguards(self):
+        task=dict(kind='reciprocal_navigation',start=[0,0,0],targets=[[1,0,0]],
+                  bounds=[[-2,2],[-1,1],[-2,2]],min_health=8,timeout=10)
+        validate_tasks([task])
+        for field,value in [('bounds',[[-2,2]]),('targets',[]),('targets',[[1,0,float('nan')]]),
+                            ('min_health',0),('timeout',float('inf')),('targets',[[10,0,0]])]:
+            with self.subTest(field=field,value=value),self.assertRaises(ValueError):
+                validate_tasks([{**task,field:value}])
 
 
 class PolicyTests(unittest.TestCase):

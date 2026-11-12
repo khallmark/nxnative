@@ -92,6 +92,34 @@ class Bridge:
         self.lock.close()
 
 
+
+def validate_tasks(tasks):
+    """Reject incomplete safeguards before opening the live control channel."""
+    def vector(value):
+        return isinstance(value,list) and len(value)==3 and all(isinstance(v,(int,float)) and math.isfinite(v) for v in value)
+    if not isinstance(tasks,list) or not tasks:
+        raise ValueError('Curriculum must be a nonempty task list')
+    for task in tasks:
+        if not isinstance(task,dict) or task.get('kind')!='reciprocal_navigation':
+            raise ValueError('Only reciprocal_navigation tasks are supported')
+        bounds=task.get('bounds')
+        if not isinstance(bounds,list) or len(bounds)!=3 or any(not isinstance(b,list) or len(b)!=2 or not all(isinstance(v,(int,float)) and math.isfinite(v) for v in b) or b[0]>=b[1] for b in bounds):
+            raise ValueError('Each task needs three finite, ordered bounds')
+        targets=task.get('targets')
+        if not vector(task.get('start')) or not isinstance(targets,list) or not targets or not all(vector(t) for t in targets):
+            raise ValueError('Start and nonempty targets must be finite 3D coordinates')
+        if any(not all(lo<=v<=hi for v,(lo,hi) in zip(point,bounds)) for point in [task['start']]+targets):
+            raise ValueError('Start/target outside declared bounds')
+        if not isinstance(task.get('min_health'),int) or not 1<=task['min_health']<=80:
+            raise ValueError('Minimum health must be a positive integer <=80')
+        for key,default,lo,hi in [('timeout',None,.1,300),('tolerance',.25,.01,1),('start_tolerance',.3,.01,1)]:
+            value=task.get(key,default)
+            if not isinstance(value,(int,float)) or not math.isfinite(value) or not lo<=value<=hi:
+                raise ValueError('Invalid task '+key)
+        if task['start']!=tasks[0]['start']:
+            raise ValueError('Tasks must share the same start anchor')
+
+
 def in_bounds(state, task):
     return all(lo<=v<=hi for v,(lo,hi) in zip(state['position'],task['bounds']))
 

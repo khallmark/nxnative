@@ -8,7 +8,7 @@ import signal
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'dm'/'tools'))
 from evolution.core import Evolution
-from evolution.live import Bridge, LiveTrials, TrialStopped
+from evolution.live import Bridge, LiveTrials, TrialStopped, validate_tasks
 
 
 def main():
@@ -26,8 +26,7 @@ def main():
     if args.generations<0:
         ap.error('generations must be nonnegative')
     config=json.loads(args.session.read_text()); tasks=json.loads(args.curriculum.read_text())
-    if not tasks or any(t.get('kind')!='reciprocal_navigation' for t in tasks):
-        ap.error('This stage supports validated reciprocal_navigation tasks only')
+    validate_tasks(tasks)
     args.output.mkdir(parents=True,exist_ok=True)
     bridge=Bridge(config)
     try:
