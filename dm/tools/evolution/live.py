@@ -278,8 +278,14 @@ def validate_tasks(tasks):
         if not vector(task.get('start')) or not isinstance(targets,list) or not targets or not all(vector(t) for t in targets):
             raise ValueError('Start and nonempty targets must be finite 3D coordinates')
         settle=task.get('settle_targets')
-        if settle is not None and (task['kind']!='checkpoint_navigation' or not isinstance(settle,list) or len(settle)!=len(targets) or any(type(v) is not bool for v in settle) or not settle[-1]):
+        if 'settle_targets' in task and (task['kind']!='checkpoint_navigation' or not isinstance(settle,list) or len(settle)!=len(targets) or any(type(v) is not bool for v in settle) or not settle[-1]):
             raise ValueError('Checkpoint settle_targets must match targets and settle at the final target')
+        buttons=task.get('target_buttons')
+        if 'target_buttons' in task:
+            if task['kind']!='checkpoint_navigation' or not isinstance(buttons,list) or len(buttons)!=len(targets) or any(v not in ('','A','X','A+X') for v in buttons):
+                raise ValueError('Checkpoint target_buttons must match targets and use empty, A, X, or A+X')
+            if settle is not None and any('X' in button and not settle[i] for i,button in enumerate(buttons)):
+                raise ValueError('Jump targets must settle before continuing')
         if any(not all(lo<=v<=hi for v,(lo,hi) in zip(point,bounds)) for point in [task['start']]+targets):
             raise ValueError('Start/target outside declared bounds')
         if not isinstance(task.get('min_health'),int) or not 1<=task['min_health']<=80:
@@ -324,6 +330,8 @@ class LiveTrials:
             return result(False,reason,target)
         for index,target in enumerate(targets):
             settle=reset or task.get('settle_targets',[True]*len(targets))[index]
+            buttons='' if reset else task.get('target_buttons',['']*len(targets))[index]
+            jumping='X' in buttons
             last_moving=time.monotonic();anchor=state['position']
             while True:
                 if getattr(self.bridge,'config',{}).get('ui') and not ui_matches(self.bridge.config,state,'gameplay'):
@@ -331,18 +339,31 @@ class LiveTrials:
                 if unsafe():return failed('Damage allowance/health or terrain limit exceeded',target)
                 if distance(state['position'],target)<=task.get('tolerance',.25):
                     if not settle:break
-                    observe(self.bridge.sample('',.25))
-                    if getattr(self.bridge,'config',{}).get('ui') and not ui_matches(self.bridge.config,state,'gameplay'):
-                        raise TrialStopped('Gameplay interrupted while settling')
-                    if unsafe():return failed('Unsafe state while settling at target',target)
-                    if distance(state['position'],target)<=task.get('tolerance',.25):break
+                    stable=True
+                    for _ in range(3 if jumping else 1):
+                        before_position=state['position'];observe(self.bridge.sample('',.25))
+                        if getattr(self.bridge,'config',{}).get('ui') and not ui_matches(self.bridge.config,state,'gameplay'):
+                            raise TrialStopped('Gameplay interrupted while settling')
+                        if unsafe():return failed('Unsafe state while settling at target',target)
+                        if jumping:
+                            stable=stable and distance(before_position,state['position'])<=.05
+                            self.log.write(json.dumps(dict(event='settle',target=target,action='',hold=.25,
+                                damage=damage,stable=stable,**state))+'\n');self.log.flush()
+                        if distance(state['position'],target)>task.get('tolerance',.25):
+                            stable=False;break
+                    if stable:break
+                    if jumping and distance(state['position'],target)<=task.get('tolerance',.25):
+                        if time.monotonic()>deadline:return result(False,'timeout',target)
+                        # Keep releasing input while an apparent landing is still moving.
+                        continue
                 if time.monotonic()>deadline:return result(False,'timeout',target)
                 if distance(anchor,state['position'])>.1:
                     anchor=state['position'];last_moving=time.monotonic()
                 if time.monotonic()-last_moving>2.:return result(False,'stuck',target)
                 decision=steer(state,previous,target,genome);before=state
-                observe(self.bridge.sample(decision.keys,decision.hold));steps+=1
-                self.log.write(json.dumps(dict(reset=reset,target=target,action=decision.keys,
+                keys='+'.join(value for value in (decision.keys,buttons) if value)
+                observe(self.bridge.sample(keys,decision.hold));steps+=1
+                self.log.write(json.dumps(dict(reset=reset,target=target,action=keys,
                     hold=decision.hold,risk=decision.risk if math.isfinite(decision.risk) else None,
                     damage=damage,**state))+'\n');self.log.flush()
                 if unsafe():return failed('Damage allowance/health or terrain limit exceeded',target)

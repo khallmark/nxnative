@@ -137,6 +137,24 @@ crediting every arrival. Keep the final destination clear of hazards: stopping
 on a boulder lane makes the evaluation depend on surviving an artificial wait.
 Reciprocal tasks retain settled arrival at every point.
 
+Checkpoint tasks can also declare `target_buttons`, one string per target: empty
+for ordinary walking, `A` for a dash/action pulse, `X` for jump, or `A+X` for both.
+Each string combines with the evolved camera-relative stick input for that leg.
+Inputs retain the evolved 0.1–0.4 second hold; the host releases between samples,
+so repeated A pulses do not establish continuous dash behavior. These controls
+must be verified in the current game and scene. No other button or command text
+is accepted. Reciprocal tasks cannot use action targets.
+
+Every jump target must settle, including intermediate ones. Arrival requires
+three neutral 0.25-second observations inside its 3D tolerance, with no adjacent
+position change exceeding 0.05 units. A transient airborne crossing is not enough;
+while the candidate landing remains in tolerance but is moving, the runner keeps
+input released and obeys the task deadline. Health, damage and terrain guards
+still apply to every sample. Jump settling observations are logged. This is a
+measured positional stability check, not an engine grounded-state flag, and does
+not discover launch points or certify unseen landing geometry. Declare the full
+jump arc in the bounds and validate the destination height before training.
+
 ## Actor discovery across scene loads
 
 An optional `actor_discovery` session profile resolves named scene actors through
