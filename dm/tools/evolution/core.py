@@ -85,15 +85,22 @@ class Evolution:
     All elites are re-evaluated each generation. Repeats and every curriculum task
     must finish before selection. A crash never turns a partial score into a winner.
     """
-    def __init__(self, path, curriculum, population=8, repeats=2, seed=7401, implementation="v1", initial_genome=None):
+    def __init__(self, path, curriculum, population=8, repeats=2, seed=7401, implementation="v1", initial_genome=None,
+                 bounds=None,mutation_rate=1.,mutation_sigma=.12,initial_sigma=.35):
         if population<4 or repeats<2 or not curriculum:
             raise ValueError('Need >=4 candidates, >=2 repeats and a curriculum')
+        self.bounds=dict(BOUNDS if bounds is None else bounds)
+        if not self.bounds or len(self.bounds)>16384 or any(not isinstance(k,str) or not k or not isinstance(v,(tuple,list)) or len(v)!=2 or not all(isinstance(x,(int,float)) and math.isfinite(x) for x in v) or v[0]>=v[1] for k,v in self.bounds.items()):
+            raise ValueError('Invalid finite gene space')
+        if any(not isinstance(x,(int,float)) or not math.isfinite(x) for x in (mutation_rate,mutation_sigma,initial_sigma)) or not 0<mutation_rate<=1 or not 0<mutation_sigma<=1 or not 0<initial_sigma<=1:
+            raise ValueError('Invalid mutation settings')
+        self.mutation_rate=mutation_rate;self.mutation_sigma=mutation_sigma
         self.db=sqlite3.connect(path)
         self.db.execute('PRAGMA journal_mode=WAL')
         self.db.executescript('''CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS trials (generation INTEGER, candidate INTEGER, task INTEGER,
           repeat INTEGER, result TEXT NOT NULL, PRIMARY KEY(generation,candidate,task,repeat));''')
-        signature=hashlib.sha256(canonical(dict(curriculum=curriculum,population=population,repeats=repeats,implementation=implementation)).encode()).hexdigest()
+        signature=hashlib.sha256(canonical(dict(curriculum=curriculum,population=population,repeats=repeats,implementation=implementation,bounds=self.bounds,mutation_rate=mutation_rate,mutation_sigma=mutation_sigma,initial_sigma=initial_sigma)).encode()).hexdigest()
         row=self.db.execute('SELECT value FROM state WHERE id=1').fetchone()
         self.rng=random.Random(seed)
         self.state: dict[str, Any]
@@ -106,19 +113,22 @@ class Evolution:
                 return tuple(map(tuples,x)) if isinstance(x,list) else x
             self.rng.setstate(tuples(self.state['rng']))
         else:
-            initial=BASELINE if initial_genome is None else initial_genome
-            if set(initial)!=set(BOUNDS) or any(not isinstance(initial[k],(int,float)) or not math.isfinite(initial[k]) or not lo<=initial[k]<=hi for k,(lo,hi) in BOUNDS.items()):
+            default=BASELINE if bounds is None else {k:(lo+hi)/2 for k,(lo,hi) in self.bounds.items()}
+            initial=default if initial_genome is None else initial_genome
+            if set(initial)!=set(self.bounds) or any(not isinstance(initial[k],(int,float)) or not math.isfinite(initial[k]) or not lo<=initial[k]<=hi for k,(lo,hi) in self.bounds.items()):
                 self.db.close()
                 raise ValueError('Seed genome does not match the current parameter bounds')
-            candidates=[initial.copy()]+[self.mutate(initial,initial,.35) for _ in range(population-1)]
+            candidates=[initial.copy()]+[self.mutate(initial,initial,initial_sigma) for _ in range(population-1)]
             self.state=dict(signature=signature,generation=0,candidates=candidates,champion=None)
             self.save()
             self.db.commit()
         self.tasks=curriculum; self.repeats=repeats
+        self.completed=set(self.db.execute('SELECT generation,candidate,task,repeat FROM trials WHERE generation=?',(self.state['generation'],)).fetchall())
 
-    def mutate(self,a,b,sigma=.12):
-        return {k:max(lo,min(hi,self.rng.choice((a[k],b[k]))+self.rng.gauss(0,sigma*(hi-lo))))
-                for k,(lo,hi) in BOUNDS.items()}
+    def mutate(self,a,b,sigma=None):
+        sigma=self.mutation_sigma if sigma is None else sigma
+        return {k:max(lo,min(hi,self.rng.choice((a[k],b[k]))+(self.rng.gauss(0,sigma*(hi-lo)) if self.mutation_rate==1 or self.rng.random()<self.mutation_rate else 0)))
+                for k,(lo,hi) in self.bounds.items()}
 
     def save(self):
         self.state['rng']=self.rng.getstate()
@@ -130,7 +140,7 @@ class Evolution:
         for rep in range(self.repeats):
             for task in range(len(self.tasks)):
                 for candidate in range(len(self.state['candidates'])):
-                    if not self.db.execute('SELECT 1 FROM trials WHERE generation=? AND candidate=? AND task=? AND repeat=?',(g,candidate,task,rep)).fetchone():
+                    if (g,candidate,task,rep) not in self.completed:
                         return g,candidate,task,rep
         return None
 
@@ -140,7 +150,7 @@ class Evolution:
         result={**result,'genome':self.state['candidates'][key[1]].copy()}
         with self.db:
             self.db.execute('INSERT INTO trials VALUES (?,?,?,?,?)',(*key,canonical(result)))
-            self.save()
+        self.completed.add(key)
 
     def advance(self):
         if self.pending() is not None:
@@ -161,4 +171,5 @@ class Evolution:
             self.state['candidates']=parents[:2]+[self.mutate(self.rng.choice(parents),self.rng.choice(parents)) for _ in range(len(scores)-2)]
             self.state['generation']+=1
             self.save()
+        self.completed.clear()
         return report

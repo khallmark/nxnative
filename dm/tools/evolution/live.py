@@ -157,6 +157,8 @@ def number(value):
 
 def ui_matches(config,state,name):
     """Every named screen is an AND of validated integer telemetry predicates."""
+    # Some games leave the HUD visible through death and the Game Over menu.
+    if name=='gameplay' and state.get('health',1)==0:return False
     for rule in config['ui'][name]:
         value=state['reads'][rule['read']][rule.get('index',0)]
         if 'mask' in rule:
@@ -212,7 +214,7 @@ def validate_ui(config):
     for path,digest in recovery['files'].items():
         if not Path(path).is_absolute() or not isinstance(digest,str) or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):
             raise ValueError('Recovery save hashes must be absolute paths and SHA256')
-    for step in recovery['steps']:
+    for step in recovery['steps']+recovery.get('death_steps',[]):
         if step.get('keys') not in ('Plus','R','L','LUp','LDown','A','B','') or step.get('before') not in ui or step.get('after') not in ui:
             raise ValueError('Each recovery step needs bounded menu input and UI guards')
         for key,default,lo,hi in [('hold',.15,.05,.5),('settle',.3,0,2),('timeout',3.,.1,60)]:
@@ -221,6 +223,12 @@ def validate_ui(config):
                 raise ValueError('Invalid recovery '+key)
     if recovery['steps'][0]['before']!='gameplay' or recovery['steps'][-1]['after']!='gameplay':
         raise ValueError('Recovery must begin and finish in observed gameplay')
+    death=recovery.get('death_steps')
+    if death is not None and (not death or death[0]['before']!='game_over' or death[-1]['after']!='gameplay'):
+        raise ValueError('Death recovery must begin at observed game_over and finish in gameplay')
+    mutable=recovery.get('mutable_after_death',{})
+    if not isinstance(mutable,dict) or (mutable and not death) or any(path not in recovery['files'] or type(limit) is not int or not 1<=limit<=16*1024*1024 for path,limit in mutable.items()):
+        raise ValueError('Death metadata needs known save paths and bounded byte limits')
 
 
 class Checkpoint:
@@ -228,9 +236,27 @@ class Checkpoint:
     def __init__(self,bridge,log):
         self.bridge=bridge;self.log=log
         self.config=bridge.config['recovery']
+        self.expected=dict(self.config['files'])
+        path=bridge.config.get('checkpoint_state')
+        self.state_path=Path(path) if path else None
+        if self.state_path is not None and not self.state_path.is_absolute():raise ValueError('Checkpoint state path must be absolute')
+        if self.state_path is not None and self.state_path.exists():
+            saved=json.loads(self.state_path.read_text());updates=saved.get('expected',{})
+            if saved.get('files')!=self.config['files'] or saved.get('mutable')!=self.config.get('mutable_after_death',{}) or not isinstance(updates,dict) or any(path not in self.config.get('mutable_after_death',{}) or not isinstance(value,str) or len(value)!=64 or any(c not in '0123456789abcdef' for c in value) for path,value in updates.items()):
+                raise TrialStopped('Checkpoint metadata manifest does not match this experiment')
+            for path,digest in updates.items():
+                if digest==self.expected[path]:continue
+                evidence=self.bridge.root/'death-metadata'/(Path(path).name+'.'+digest+'.bin')
+                try:
+                    with evidence.open('rb') as source:data=source.read(self.config['mutable_after_death'][path]+1)
+                except OSError as exc:raise TrialStopped('Missing accepted death metadata evidence') from exc
+                if len(data)>self.config['mutable_after_death'][path] or hashlib.sha256(data).hexdigest()!=digest:
+                    raise TrialStopped('Accepted death metadata evidence changed')
+            self.expected.update(updates)
 
-    def verify_files(self):
-        for path,expected in self.config['files'].items():
+    def verify_files(self,ignore=()):
+        for path,expected in self.expected.items():
+            if path in ignore:continue
             try:
                 actual=hashlib.sha256(Path(path).read_bytes()).hexdigest()
             except OSError as exc:
@@ -238,23 +264,56 @@ class Checkpoint:
             if actual!=expected:
                 raise TrialStopped('Checkpoint save changed: '+path)
 
+    def validate_anchor(self,state,task):
+        if not ui_matches(self.bridge.config,state,'gameplay') or not in_bounds(state,task) or state['health']<task.get('start_health',task['min_health']) or distance(state['position'],task['start'])>task.get('start_tolerance',.3):
+            raise TrialStopped('Loaded checkpoint does not match the declared start/health')
+
+    def accept_death_metadata(self,state,task):
+        # Only a calibrated normal-game death transition may refresh these hashes.
+        # Progress/caption files remain strict unless explicitly named by the profile.
+        self.validate_anchor(state,task)
+        mutable=self.config.get('mutable_after_death',{})
+        self.verify_files(ignore=mutable)
+        updates={}
+        for path,limit in mutable.items():
+            with Path(path).open('rb') as source:data=source.read(limit+1)
+            if not data or len(data)>limit:raise TrialStopped('Unexpected death metadata size: '+path)
+            digest=hashlib.sha256(data).hexdigest()
+            if digest!=self.expected[path]:
+                archive=self.bridge.root/'death-metadata';archive.mkdir(exist_ok=True)
+                evidence=archive/(Path(path).name+'.'+digest+'.bin');evidence.write_bytes(data)
+                self.log.write(json.dumps(dict(event='death_metadata_changed',path=path,previous=self.expected[path],sha256=digest,size=len(data),evidence=str(evidence)))+'\n')
+            updates[path]=digest
+        self.log.flush();self.expected.update(updates)
+        if self.state_path is not None and mutable:
+            temporary=self.state_path.with_suffix('.tmp')
+            temporary.write_text(json.dumps(dict(files=self.config['files'],mutable=mutable,
+                expected={path:self.expected[path] for path in mutable}),sort_keys=True)+'\n')
+            temporary.replace(self.state_path)
+
     def restore(self,task):
         self.verify_files()
-        for index,step in enumerate(self.config['steps']):
-            state=self.bridge.wait_ui(step['before'])
+        state=self.bridge.sample(actors=False)
+        steps=self.config['steps'];death_count=0
+        if state['health']==0:
+            if not self.config.get('death_steps'):
+                raise TrialStopped('Death recovery has not been calibrated')
+            death_count=len(self.config['death_steps']);steps=self.config['death_steps']+steps
+        for index,step in enumerate(steps):
+            state=self.bridge.wait_ui(step['before'],step.get('timeout',3.))
             if step['keys']=='Plus' and step['before']=='gameplay' and step['after']=='pause':
                 state=guarded_pause(self.bridge,step.get('timeout',3.),step.get('hold',.15))
             else:
                 self.bridge.sample(step['keys'],step.get('hold',.15),actors=False)
                 # Other menu inputs are never retried on an uncertain result.
-                time.sleep(step.get('settle',.3))
+                getattr(self.bridge,'settle',time.sleep)(step.get('settle',.3))
                 state=self.bridge.wait_ui(step['after'],step.get('timeout',3.))
+            if death_count and index+1==death_count:self.accept_death_metadata(state,task)
             self.log.write(json.dumps(dict(event='recovery_step',step=index,state=state))+'\n')
             self.log.flush()
         self.verify_files()
         state=self.bridge.sample('',.3,actors=False)
-        if not ui_matches(self.bridge.config,state,'gameplay') or not in_bounds(state,task) or state['health']<task.get('start_health',task['min_health']) or distance(state['position'],task['start'])>task.get('start_tolerance',.3):
-            raise TrialStopped('Loaded checkpoint does not match the declared start/health')
+        self.validate_anchor(state,task)
         if self.bridge.config.get('actor_discovery'):
             state=self.bridge.wait_actors()
         self.log.write(json.dumps(dict(event='checkpoint_restored',state=state))+'\n')

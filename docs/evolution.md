@@ -17,7 +17,117 @@ a failed attempt and uses a guarded normal-game Load sequence. Invalid telemetry
 an unrecognized menu, a changed checkpoint or failed recovery stops the run.
 Reciprocal navigation still stops on damage or an unsafe terrain transition.
 
-## Running
+## Native whole-attempt evolution
+
+`scripts/evolve_replay.py` evaluates many-gene input timelines while the host
+plays them at guest input reads. The default chromosome has 128 segments and
+768 real-valued genes: left-stick X/Y, dash/action A, jump X, attack Y, and hold
+frames per segment. Button genes above zero press that button. Hold genes round
+to 1–30 frames; the chromosome repeats to the declared frame horizon. Controls
+must be checked for the current game. This is an action-sequence GA, not a neural
+network or an automatically learned map.
+
+```sh
+python3 scripts/evolve_replay.py --session /game/run/native-session.json \
+  --objective /game/run/objective.json --output /game/run/native-training \
+  --population 8 --repeats 2 --generations 0
+```
+
+The objective JSON declares `start`, `target` (3D points), `start_health`, and
+`horizon_frames` (1–1,000,000). Optional fields are `segments` (128), `tolerance`
+(0.5), `start_tolerance` (0.3), `poll_seconds` (0.05), `stall_seconds` (30), and
+`initial_direction` (two stick coordinates, default `[0, 1]`). Use a fresh output
+folder after changing code, session, objective or mutation settings. An earlier
+compatible chromosome can seed the search with `--seed-champion`; its fitness is
+never imported. Sparse crossover/mutation defaults to a 0.1 mutation probability
+per gene and sigma 0.12 of its range. Selection follows a complete generation
+with at least four candidates and two interleaved evaluations each; each death
+is persisted immediately, while offspring are selected at generation boundaries.
+
+Damage, falls, brief lack of movement and reaching the target do not end native
+attempts. They continue until a native zero-health guard or the fixed horizon.
+A horizon is a **censored survival observation**, never a death. Best observed
+3D distance gives progress bins 0–99; three successive increasing-frame samples
+inside tolerance with adjacent movement at most 0.05 give objective bin 100.
+Fitness is `progress_bin * (horizon_frames + 1) + alive_frames`: progress outranks
+passive survival, then longer survival wins within a bin. Positional stability
+is not an engine grounded-state flag. Objectives, transitions and completion
+flags still need game-specific validation.
+
+The session additionally needs `recovery.death_steps`, starting in positively
+observed `game_over` and finishing in `gameplay`. The ordinary checkpoint Load
+sequence then restores the exact declared start. A visible HUD alone cannot
+establish gameplay at zero health; some games retain it at Game Over. Validate
+the menu identity and visibility after its death animation, and verify all save
+hashes before and after recovery. The native adapter executes UI hold/settle
+intervals as guest frames using `replay_fps` (default 60). This conversion and the
+recovery sequence must be calibrated at the chosen clock/pacing settings.
+
+If a verified death/Continue flow rewrites metadata such as an option file,
+`recovery.mutable_after_death` can map only those observed paths to maximum byte
+sizes. Every path must already have a starting hash in `files`. After the guarded
+death flow returns to the exact anchor with sufficient health, all other hashes
+must still match. The adapter archives each new metadata value, logs its old/new
+hashes, and atomically persists the accepted hashes in `checkpoint-state.json`
+for resume. It never writes game saves. Before death and during ordinary Load,
+all files remain strict. Do not include progress/caption files merely to bypass
+a failure; such a change needs a newly verified checkpoint and experiment.
+
+The runner batches fixed telemetry and validates identities throughout attempts.
+It does not perform actor discovery or reactive steering during native timelines.
+A changed identity, unexpected menu, changed save, invalid native epoch, read
+error, or stalled guest frame counter interrupts evaluation without assigning
+fitness. The host releases scripted input on death, cancellation and completion;
+physical input is preserved and must not be used concurrently. SIGINT/SIGTERM
+cancels replay, retains completed attempts and requests a normal pause when
+possible. A killed Python process leaves at most its finite native timeline;
+there is no controller heartbeat watchdog.
+
+`episode_finished` records compile time, native survival frames, episode wall
+time, frames per wall second, reset time and attempts per minute. The native
+`stop_frame` freezes terminal timing; later observation latency does not extend
+life. Memory reads are asynchronous, with start/end frame brackets reported as
+observation skew. Measure actual throughput and behavior before claiming speedup
+from `DM_DETCLOCK` or headless mode; a fast timeline compiler is not fast gameplay.
+
+### Native replay protocol
+
+Start the host with a fresh `DM_CTL` path. `DM_CTL_POLL_US=1000` reduces its command
+poll interval from the default 100,000 microseconds; accepted values are integral
+1,000–1,000,000. The native input loop does not wait for Python observations.
+
+```text
+replay /absolute/timeline /absolute/ack [health=hex-address:decimal-u32-threshold]
+replay_status /absolute/ack
+replay_cancel /absolute/ack
+replay_observe /absolute/read-request /absolute/ack
+```
+
+Every request uses a unique ACK path, without whitespace. The host publishes
+protocol-1 JSON atomically. An accepted replay increments `epoch`, starts at the
+current guest frame plus one and replaces only frame-based input. Legacy scripts
+containing seconds block replacement. Manual DM_CTL button/drag commands are
+rejected during native replay. Invalid replacements leave the active replay
+intact; failure to publish the start ACK cancels the accepted replacement.
+
+Timeline lines use `f0:L0/1+A~f12`, then e.g. `f12:L0/1+A+X~f3`.
+Starts and positive holds are integral, ordered and nonoverlapping. Adjacent
+intervals preserve held buttons; gaps release them. Empty keys mean neutral.
+Seconds, repeats, unknown keys, nonfinite sticks and overflowing frames are
+rejected. The limits are 1,048,576 steps and a 128 MiB regular file. Guards read
+an aligned current-health u32 once per new input frame, release at or below the
+threshold, and report unreadable memory separately. A readable address alone
+cannot prove actor identity; the Python profile provides that validation.
+
+ACKs report `ok`, `error`, `epoch`, `current_frame`, `start_frame`, exclusive
+`end_frame`, `stop_frame`, step indices, `active`, `reason`, and guard evidence.
+The observer accepts lines `hex-address decimal-byte-count`, at most 128 ranges,
+4 KiB each and 64 KiB total. Each result has address, size, hexadecimal bytes or
+an explicit error; failed reads never become zero-filled observations. The
+Python adapter chunks and reassembles larger reads. `current_frame` and
+`observed_frame_end` bracket the reads; this is not a frozen scene snapshot.
+
+## Running the waypoint controller
 
 Keep the session configuration, curriculum, dumps, SQLite databases and game saves
 outside this repository. Start the game with a fresh `DM_CTL` file. Discover and
@@ -112,9 +222,8 @@ The sequence starts
 and finishes in observed `gameplay`. Save hashes are checked before and after;
 the final position, health and bounds must match the curriculum before another
 trial can begin. A checkpoint task uses this reset after both success and failure.
-Unknown screens and death are not automatically recoverable unless the configured
-flow explicitly handles their observed state; the current gameplay-starting flow
-stops on them.
+Unknown screens stop the runner. Configured `death_steps` handle only a positively
+observed Game Over screen before the ordinary gameplay-starting Load flow.
 
 First test recovery separately from evolution:
 

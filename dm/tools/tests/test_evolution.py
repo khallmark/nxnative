@@ -221,7 +221,9 @@ class CheckpointTests(unittest.TestCase):
                 def wait_ui(self,name,*args):
                     if name=='pause':raise TrialStopped('Expected pause')
                     return {}
-                def sample(self,keys,*args,**kwargs):self.actions.append(keys)
+                def sample(self,keys=None,*args,**kwargs):
+                    if keys is not None:self.actions.append(keys)
+                    return dict(health=12)
             bridge=FakeBridge()
             with patch('evolution.live.guarded_pause',side_effect=TrialStopped('Unknown screen')):
                 with self.assertRaises(TrialStopped):Checkpoint(bridge,io.StringIO()).restore({})

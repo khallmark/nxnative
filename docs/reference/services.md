@@ -310,6 +310,14 @@ Most service calls can be found before they crash, before the first boot or the 
 
 ## Input
 
+### Live scripted actions wait for every observation
+
+- **Symptom:** a Python game controller waits for a 100 ms control-file poll and memory dumps between short button holds; releases between samples prevent continuous dash and make input throughput depend on observation latency.
+- **Cause:** ordinary `DM_CTL` key commands execute bounded wall-time holds on the control thread, while startup `DM_KEYS` is not replaceable between attempts.
+- **Fix:** protocol-1 `replay` replaces a validated relative frame timeline under the HID mutex. Input is applied at guest reads; adjacent holds stay continuous. Native health guards release input and freeze the terminal frame. Atomic ACKs report epochs and outcomes; `replay_observe` batches safe memory reads with frame brackets and explicit per-read errors. `DM_CTL_POLL_US` optionally reduces command latency. Legacy seconds scripts block replacement, and manual commands cannot interrupt active replay. See [whole-attempt evolution](../evolution.md#native-whole-attempt-evolution) for limits and commands.
+- **Check:** `make -C dm/host/tests GAME=<id> replay` covers the existing HID baseline, parsing, replacement, cancellation, death/read errors, observations and concurrent HID/replay use. Python tests verify chunking, exact death-frame scoring, recovery and persistent many-gene evolution. Live speed and accelerated-clock fidelity require separate measurements.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), during checkpoint-based navigation training on macOS.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

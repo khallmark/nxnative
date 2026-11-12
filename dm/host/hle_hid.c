@@ -15,6 +15,13 @@
 #include <pthread.h>
 #include <time.h>
 #include <math.h>
+#include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include "motion_fusion.h"
 
 enum { NPAD_NO1 = 0, NPAD_HANDHELD = 0x20 };
@@ -36,7 +43,7 @@ _Static_assert(sizeof(NpadState) == 0x28, "NpadState");
 // their own path because a connected controller publishes its whole state on every change (a DualShock 4's sticks change all the time), which overwrote them on the shared one;
 // the separate paths also keep scripted input out of DM_REC, which records the physical ones (rec_read)
 static _Atomic uint64_t g_btn, g_axes, g_latch, g_sc_btn, g_sc_axes, g_sc_latch, g_pad_btn[DM_PLAYERS], g_pad_axes[DM_PLAYERS], g_pad_latch[DM_PLAYERS];
-static _Atomic uint64_t g_peek_latch;   // presses since the last dm_input_peek (the applet's reader)
+static _Atomic uint64_t g_peek_latch, g_sc_peek_latch;   // presses since the last dm_input_peek (the applet's reader)
 static _Atomic int g_hold;              // an applet holds the input (dm_input_hold)
 static _Atomic int64_t g_sampling = 1 << 16;   // starts high so the history entries below the newest keep positive sampling numbers
 static uint64_t pack(int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
@@ -71,14 +78,14 @@ void dm_input_hold(int on) {
     atomic_store(&g_latch, 0); atomic_store(&g_sc_latch, 0); for (int p = 0; p < DM_PLAYERS; p++) atomic_store(&g_pad_latch[p], 0);   // a press made for the applet is not the game's
 }
 void dm_input_peek(uint64_t *buttons, int32_t axes[4]) {
-    uint64_t b = atomic_load(&g_btn) | atomic_load(&g_sc_btn) | atomic_exchange(&g_peek_latch, 0), k = atomic_load(&g_axes), c = atomic_load(&g_sc_axes);
+    uint64_t b = atomic_load(&g_btn) | atomic_load(&g_sc_btn) | atomic_exchange(&g_peek_latch, 0) | atomic_exchange(&g_sc_peek_latch, 0), k = atomic_load(&g_axes), c = atomic_load(&g_sc_axes);
     for (int i = 0; i < 4; i++) axes[i] = pick(ax(k, i), ax(c, i));
     for (int p = 0; p < DM_PLAYERS; p++) { b |= atomic_load(&g_pad_btn[p]); uint64_t v = atomic_load(&g_pad_axes[p]); for (int i = 0; i < 4; i++) axes[i] = pick(axes[i], ax(v, i)); }
     *buttons = b & 0xffffull;
 }
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { dm_pad_set_player(0, buttons, lx, ly, rx, ry); }
 static void script_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
-    uint64_t old = atomic_exchange(&g_sc_btn, buttons); atomic_fetch_or(&g_sc_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_sc_axes, pack(lx, ly, rx, ry));
+    uint64_t old = atomic_exchange(&g_sc_btn, buttons); atomic_fetch_or(&g_sc_latch, buttons & ~old); atomic_fetch_or(&g_sc_peek_latch, buttons & ~old); atomic_store(&g_sc_axes, pack(lx, ly, rx, ry));
     shake_note();
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
@@ -97,6 +104,7 @@ static int step_add(const key_step *st) {
     if (g_nsteps == g_cap_steps) { int cap = g_cap_steps ? g_cap_steps * 2 : 64; key_step *n = realloc(g_steps, (size_t)cap * sizeof *n); if (!n) return 0; g_steps = n; g_cap_steps = cap; }
     g_steps[g_nsteps++] = *st; return 1;
 }
+static _Atomic int g_legacy_keys_on;
 static void *keys_main(void *arg) {
     // touching: the previous step handed its finger over to this one; released: the frame the previous step released in (a frame step presses in a later frame, so the game reads the
     // release between two presses even when the replay runs late and the next step is already due: two taps of A stay two presses, not one long one)
@@ -116,6 +124,7 @@ static void *keys_main(void *arg) {
         touching = next && s->tap;
         if (!next) { script_set(0, 0, 0, 0, 0); if (s->tap) dm_touch_script(NULL, 0); released = (int64_t)dm_guest_frame(); }
     }
+    atomic_store_explicit(&g_legacy_keys_on, 0, memory_order_release);
     return NULL;
 }
 // A list of frame steps that are all held in frames (what DM_REC writes) is not played by keys_main, whose thread presses within 5 ms after a present, before or after the game's read
@@ -124,9 +133,12 @@ static void *keys_main(void *arg) {
 static _Atomic int g_sync_on; static pthread_mutex_t g_sync_mu = PTHREAD_MUTEX_INITIALIZER;
 static int g_sync_next, g_sync_held;   // the next step to press; whether g_steps[g_sync_next - 1] is held
 static int keys_framed(void) { for (int i = 0; i < g_nsteps; i++) if (!g_steps[i].frame || !g_steps[i].fhold) return 0; return g_nsteps > 0; }
+static int replay_sync(void);
 static void keys_sync(void) {
+    if (replay_sync()) return;
     if (!atomic_load_explicit(&g_sync_on, memory_order_acquire)) return;
     pthread_mutex_lock(&g_sync_mu);
+    if (!atomic_load_explicit(&g_sync_on, memory_order_relaxed)) { pthread_mutex_unlock(&g_sync_mu); return; }
     uint64_t f = dm_guest_frame();
     for (;;) {
         if (g_sync_held) {
@@ -202,21 +214,282 @@ static char *keys_file(const char *path) {
          n = fread(text + len, 1, cap - len - 1, f); len += n; } while (n);
     fclose(f); text[len] = 0; return text;
 }
+// DM_CTL replay timelines are relative, integral frames. Parse into private storage,
+// then replace the current replay under g_sync_mu; the game never sees a partial list.
+// This vector is separate from DM_KEYS, whose seconds thread owns g_steps until exit.
+typedef struct { uint64_t at, end; key_step input; } replay_step;
+typedef struct {
+    replay_step *steps; size_t count, next; int64_t applied;
+    uint64_t epoch, start, end, last_frame, stop_frame, guard_address;
+    uint32_t guard_threshold, last_health; int health_valid;
+    const char *reason;
+} replay_state;
+static replay_state g_replay = {.applied = -1, .reason = "idle"};
+static _Atomic int g_replay_on;
+#define REPLAY_FILE_MAX (128u << 20)
+#define REPLAY_READS_MAX 128
+#define REPLAY_READ_MAX 4096
+#define REPLAY_READ_TOTAL (64u << 10)
+
+static int replay_uint(const char *s, int base, uint64_t *value) {
+    if (!s || !*s || *s == '+' || *s == '-' || isspace((unsigned char)*s)) return 0;
+    errno = 0; char *end; unsigned long long n = strtoull(s, &end, base);
+    if (errno || *end) return 0;
+    *value = (uint64_t)n; return 1;
+}
+static int replay_pair(const char *s, char separator, float low, float high, float *x, float *y) {
+    char *end; errno = 0; float a = strtof(s, &end);
+    if (end == s || errno || *end != separator || !isfinite(a) || a < low || a > high) return 0;
+    const char *second = end + 1; errno = 0; float b = strtof(second, &end);
+    if (end == second || errno || *end || !isfinite(b) || b < low || b > high) return 0;
+    *x = a; *y = b; return 1;
+}
+// Strict version of parse_keys: unknown/partial tokens are errors, not silent neutral input.
+static int replay_keys(char *spec, key_step *st) {
+    if (!*spec) return 1;   // an explicit neutral interval
+    for (char *k = spec; k;) {
+        char *plus = strchr(k, '+'); if (plus) *plus = 0;
+        if (!*k) return 0;
+        int found = 0;
+        for (int b = 0; b < 16; b++) if (!strcasecmp(k, key_names[b])) { st->btn |= 1ull << b; found = 1; break; }
+        static const char *const dirs[] = {"LLeft", "LUp", "LRight", "LDown", "RLeft", "RUp", "RRight", "RDown"};
+        for (int d = 0; d < 8; d++) if (!strcasecmp(k, dirs[d])) {
+            int32_t *axis = d < 4 ? (d & 1 ? &st->ly : &st->lx) : (d & 1 ? &st->ry : &st->rx);
+            *axis = (d % 4 == 0 || d % 4 == 3) ? -32767 : 32767; found = 1; break;
+        }
+        float x, y;
+        if (!found && (k[0] == 'L' || k[0] == 'R') && replay_pair(k + 1, '/', -1, 1, &x, &y)) {
+            if (k[0] == 'L') { st->lx = (int32_t)lrintf(x * 32767); st->ly = (int32_t)lrintf(y * 32767); }
+            else { st->rx = (int32_t)lrintf(x * 32767); st->ry = (int32_t)lrintf(y * 32767); } found = 1;
+        }
+        if (!found && (k[0] == 'T' || k[0] == 't') && replay_pair(k + 1, 'x', 0, 1, &x, &y)) { st->tap = 1; st->tx = x; st->ty = y; found = 1; }
+        if (!strcasecmp(k, "Shake")) { st->btn |= DM_BTN_SHAKE; found = 1; }
+        if (!found || (plus && !plus[1])) return 0;
+        k = plus ? plus + 1 : NULL;
+    }
+    return 1;
+}
+static char *replay_file(const char *path, size_t limit, const char **error) {
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0) { *error = "file_open"; return NULL; }
+    FILE *f = fdopen(fd, "rb"); if (!f) { close(fd); *error = "file_open"; return NULL; }
+    struct stat st;
+    if (fstat(fileno(f), &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > limit) { fclose(f); *error = "file_size"; return NULL; }
+    size_t size = (size_t)st.st_size; char *text = malloc(size + 1);
+    if (!text) { fclose(f); *error = "allocation"; return NULL; }
+    size_t n = fread(text, 1, size, f); int failed = ferror(f) || feof(f);
+    int extra = failed ? EOF : fgetc(f); failed |= ferror(f); fclose(f);
+    if (n != size || extra != EOF || failed || memchr(text, 0, size)) { free(text); *error = "file_read"; return NULL; }
+    text[size] = 0; return text;
+}
+static replay_step *replay_parse(char *text, size_t *count, const char **error) {
+    replay_step *steps = NULL; size_t n = 0, capacity = 0; char *save;
+    *count = 0;
+    for (char *tok = strtok_r(text, ", \t\r\n", &save); tok; tok = strtok_r(NULL, ", \t\r\n", &save)) {
+        char *colon = strchr(tok, ':'), *hold = colon ? strchr(colon + 1, '~') : NULL;
+        uint64_t at, duration;
+        if (!colon || !hold || tok[0] != 'f' || hold[1] != 'f') { *error = "frame_syntax"; goto fail; }
+        *colon = 0; *hold = 0;
+        if (!replay_uint(tok + 1, 10, &at) || !replay_uint(hold + 2, 10, &duration) || !duration) { *error = "frame_syntax"; goto fail; }
+        if (duration > UINT64_MAX - at) { *error = "frame_overflow"; goto fail; }
+        if (n && at < steps[n - 1].end) { *error = "overlap"; goto fail; }
+        replay_step one = {.at = at, .end = at + duration};
+        if (!replay_keys(colon + 1, &one.input)) { *error = "key_syntax"; goto fail; }
+        if (n == KEY_STEPS) { *error = "step_limit"; goto fail; }
+        if (n == capacity) {
+            size_t cap = capacity ? capacity * 2 : 64; replay_step *p = realloc(steps, cap * sizeof *p);
+            if (!p) { *error = "allocation"; goto fail; } steps = p; capacity = cap;
+        }
+        steps[n++] = one;
+    }
+    if (!n) { *error = "empty_timeline"; goto fail; }
+    *count = n; return steps;
+fail:
+    free(steps); return NULL;
+}
+static int replay_read(uint64_t address, size_t size, void *out) {
+    if (!address || !size || (uint64_t)size > UINT64_MAX - address) return 0;
+    mach_vm_size_t got = 0;
+    return mach_vm_read_overwrite(mach_task_self(), (mach_vm_address_t)address, (mach_vm_size_t)size,
+                                 (mach_vm_address_t)(uintptr_t)out, &got) == KERN_SUCCESS && got == size;
+}
+// Only the scripted latches are cleared; physical keyboard/controller edges stay intact.
+static void replay_release(void) {
+    script_set(0, 0, 0, 0, 0); atomic_store(&g_sc_latch, 0); atomic_store(&g_sc_peek_latch, 0); dm_touch_script(NULL, 0);
+}
+static void replay_stop_locked(const char *reason) {
+    replay_release(); g_replay.applied = -1; g_replay.reason = reason; g_replay.stop_frame = dm_guest_frame();
+    atomic_store_explicit(&g_replay_on, 0, memory_order_release);
+}
+// Called at native HID reads, once per guest frame for the guard. No Python round trip.
+static int replay_sync(void) {
+    if (!atomic_load_explicit(&g_replay_on, memory_order_acquire)) return 0;
+    pthread_mutex_lock(&g_sync_mu);
+    if (!atomic_load_explicit(&g_replay_on, memory_order_relaxed)) { pthread_mutex_unlock(&g_sync_mu); return 0; }
+    uint64_t frame = dm_guest_frame();
+    if (g_replay.last_frame != UINT64_MAX && frame < g_replay.last_frame) { replay_stop_locked("frame_regression"); goto done; }
+    if (frame != g_replay.last_frame) {
+        g_replay.last_frame = frame;
+        if (g_replay.guard_address) {
+            uint32_t health;
+            g_replay.health_valid = replay_read(g_replay.guard_address, sizeof health, &health);
+            if (!g_replay.health_valid) { replay_stop_locked("guard_read_error"); goto done; }
+            g_replay.last_health = health;
+            if (health <= g_replay.guard_threshold) { replay_stop_locked("death"); goto done; }
+        }
+    }
+    if (frame >= g_replay.end) { g_replay.next = g_replay.count; replay_stop_locked("completed"); goto done; }
+    int64_t selected = g_replay.applied;
+    while (g_replay.next < g_replay.count && g_replay.steps[g_replay.next].at <= frame) selected = (int64_t)g_replay.next++;
+    if (selected >= 0 && g_replay.steps[selected].end <= frame) selected = -1;
+    if (selected != g_replay.applied) {
+        if (selected < 0) replay_release();
+        else {
+            const key_step *s = &g_replay.steps[selected].input;
+            if (s->tap) { dm_touch touch = {0, s->tx, s->ty}; dm_touch_script(&touch, 1); }
+            else if (g_replay.applied >= 0 && g_replay.steps[g_replay.applied].input.tap) dm_touch_script(NULL, 0);
+            script_set(s->btn, s->lx, s->ly, s->rx, s->ry);
+        }
+        g_replay.applied = selected;
+    }
+done:
+    pthread_mutex_unlock(&g_sync_mu); return 1;
+}
+// Every ACK is a snapshot of replay state. This prefix leaves the object open for reads.
+static void replay_json(FILE *f, const char *error) {
+    pthread_mutex_lock(&g_sync_mu);
+    fprintf(f, "{\"protocol\":1,\"ok\":%s,\"error\":", error ? "false" : "true");
+    if (error) fprintf(f, "\"%s\"", error); else fputs("null", f);
+    fprintf(f, ",\"epoch\":%llu,\"current_frame\":%llu,\"start_frame\":%llu,\"end_frame\":%llu,\"steps\":%zu,\"index\":%zu,\"step\":%lld,\"active\":%s,\"reason\":\"%s\",\"guard_address\":\"0x%llx\",\"guard_threshold\":%u,\"last_health\":",
+            (unsigned long long)g_replay.epoch, (unsigned long long)dm_guest_frame(), (unsigned long long)g_replay.start,
+            (unsigned long long)g_replay.end, g_replay.count, g_replay.next, (long long)g_replay.applied,
+            atomic_load(&g_replay_on) ? "true" : "false", g_replay.reason,
+            (unsigned long long)g_replay.guard_address, g_replay.guard_threshold);
+    if (g_replay.health_valid) fprintf(f, "%u", g_replay.last_health); else fputs("null", f);
+    fprintf(f, ",\"stop_frame\":%llu", (unsigned long long)g_replay.stop_frame);
+    pthread_mutex_unlock(&g_sync_mu);
+}
+// Reserve an adjacent temporary before mutating input. Rename publishes complete JSON.
+static FILE *replay_ack_open(const char *path, char tmp[PATH_MAX]) {
+    if (!path || path[0] != '/' || snprintf(tmp, PATH_MAX, "%s.tmp.XXXXXX", path) >= PATH_MAX) return NULL;
+    int fd = mkstemp(tmp); if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "w"); if (!f) { close(fd); unlink(tmp); } return f;
+}
+static int replay_ack_close(FILE *f, const char *tmp, const char *path) {
+    int failed = ferror(f); if (fclose(f)) failed = 1;
+    if (failed || rename(tmp, path)) { unlink(tmp); LOG("[RED] DM_CTL replay: cannot publish %s", path); return 0; }
+    return 1;
+}
+static const char *replay_guard(char *spec, uint64_t *address, uint32_t *threshold) {
+    if (strncmp(spec, "health=", 7)) return "guard_syntax";
+    char *colon = strchr(spec + 7, ':'); if (!colon) return "guard_syntax"; *colon = 0;
+    uint64_t value;
+    if (!replay_uint(spec + 7, 16, address) || !*address || (*address & 3) || *address > UINT64_MAX - 4 ||
+        !replay_uint(colon + 1, 10, &value) || value > UINT32_MAX) return "guard_syntax";
+    *threshold = (uint32_t)value; return NULL;
+}
+static const char *replay_install(replay_step *steps, size_t count, uint64_t address, uint32_t threshold) {
+    const char *error = NULL;
+    pthread_mutex_lock(&g_sync_mu);
+    uint64_t frame = dm_guest_frame();
+    if (atomic_load_explicit(&g_legacy_keys_on, memory_order_acquire)) error = "legacy_seconds_active";
+    else if (frame == UINT64_MAX || steps[count - 1].end > UINT64_MAX - (frame + 1) || g_replay.epoch == UINT64_MAX) error = "frame_overflow";
+    else {
+        uint64_t base = frame + 1, epoch = g_replay.epoch + 1;
+        for (size_t i = 0; i < count; i++) { steps[i].at += base; steps[i].end += base; }
+        atomic_store(&g_sync_on, 0); g_sync_held = 0; replay_release(); free(g_replay.steps);
+        g_replay = (replay_state){.steps = steps, .count = count, .applied = -1, .epoch = epoch, .start = base,
+            .end = steps[count - 1].end, .last_frame = UINT64_MAX, .guard_address = address, .guard_threshold = threshold, .reason = "running"};
+        atomic_store_explicit(&g_replay_on, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_sync_mu); return error;
+}
+typedef struct { uint64_t address; size_t size; } replay_observation;
+static const char *replay_observe_parse(char *text, replay_observation reads[REPLAY_READS_MAX], size_t *count) {
+    size_t total = 0; *count = 0; char *save;
+    for (char *line = strtok_r(text, "\r\n", &save); line; line = strtok_r(NULL, "\r\n", &save)) {
+        char *fields, *address = strtok_r(line, " \t", &fields), *size = strtok_r(NULL, " \t", &fields);
+        if (!address) continue;
+        uint64_t a, n;
+        if (!size || strtok_r(NULL, " \t", &fields) || !replay_uint(address, 16, &a) || !replay_uint(size, 10, &n) || !a || !n ||
+            n > REPLAY_READ_MAX || n > UINT64_MAX - a) return "read_syntax";
+        if (*count == REPLAY_READS_MAX || n > REPLAY_READ_TOTAL - total) return "read_limit";
+        reads[(*count)++] = (replay_observation){a, (size_t)n}; total += (size_t)n;
+    }
+    return *count ? NULL : "empty_reads";
+}
+// Returns 1 for any replay command, including invalid ones (never fall through to a key).
+static int replay_command(char *line) {
+    if (strncmp(line, "replay", 6) || (line[6] && !isspace((unsigned char)line[6]) && line[6] != '_')) return 0;
+    char *save, *args[6]; size_t argc = 0;
+    for (char *tok = strtok_r(line, " \t", &save); tok && argc < 6; tok = strtok_r(NULL, " \t", &save)) args[argc++] = tok;
+    int run = argc && !strcmp(args[0], "replay"), observe = argc && !strcmp(args[0], "replay_observe");
+    int cancel = argc && !strcmp(args[0], "replay_cancel"), status = argc && !strcmp(args[0], "replay_status");
+    size_t ack_index = run || observe ? 2 : 1;
+    if ((!run && !observe && !cancel && !status) || argc <= ack_index) { LOG("[RED] DM_CTL: malformed replay command"); return 1; }
+    const char *ack = args[ack_index], *error = NULL; char tmp[PATH_MAX];
+    FILE *out = replay_ack_open(ack, tmp); if (!out) { LOG("[RED] DM_CTL replay: cannot create ACK %s", ack); return 1; }
+    size_t expected = run ? (argc == 4 ? 4 : 3) : observe ? 3 : 2;
+    if (argc != expected) error = "command_syntax";
+    uint64_t accepted_epoch = 0;
+    replay_observation reads[REPLAY_READS_MAX]; size_t nreads = 0;
+    if (!error && run) {
+        uint64_t address = 0; uint32_t threshold = 0;
+        if (argc == 4) error = replay_guard(args[3], &address, &threshold);
+        if (!error && args[1][0] != '/') error = "path_syntax";
+        char *text = error ? NULL : replay_file(args[1], REPLAY_FILE_MAX, &error);
+        size_t count = 0; replay_step *steps = text ? replay_parse(text, &count, &error) : NULL; free(text);
+        if (steps) { error = replay_install(steps, count, address, threshold); if (error) free(steps); else accepted_epoch = g_replay.epoch; }
+    } else if (!error && cancel) {
+        pthread_mutex_lock(&g_sync_mu); if (atomic_load(&g_replay_on)) replay_stop_locked("cancelled"); pthread_mutex_unlock(&g_sync_mu);
+    } else if (!error && observe) {
+        if (args[1][0] != '/') error = "path_syntax";
+        char *text = error ? NULL : replay_file(args[1], 16384, &error);
+        if (text) error = replay_observe_parse(text, reads, &nreads); free(text);
+    }
+    replay_json(out, error);
+    if (observe) {
+        fputs(",\"reads\":[", out);
+        for (size_t i = 0; !error && i < nreads; i++) {
+            unsigned char bytes[REPLAY_READ_MAX]; int ok = replay_read(reads[i].address, reads[i].size, bytes);
+            fprintf(out, "%s{\"address\":\"0x%llx\",\"size\":%zu,\"hex\":", i ? "," : "", (unsigned long long)reads[i].address, reads[i].size);
+            if (ok) { fputc('"', out); for (size_t b = 0; b < reads[i].size; b++) fprintf(out, "%02x", bytes[b]); fputc('"', out); }
+            else fputs("null", out);
+            fprintf(out, ",\"error\":%s}", ok ? "null" : "\"read_error\"");
+        }
+        fprintf(out, "],\"observed_frame_end\":%llu", (unsigned long long)dm_guest_frame());
+    }
+    fputs("}\n", out);
+    if (!replay_ack_close(out, tmp, ack) && accepted_epoch) {
+        pthread_mutex_lock(&g_sync_mu);
+        if (g_replay.epoch == accepted_epoch && atomic_load(&g_replay_on)) replay_stop_locked("ack_error");
+        pthread_mutex_unlock(&g_sync_mu);
+    }
+    return 1;
+}
+
 static void ctl_start(void);
 static void rec_start(void);
 void hid_keys_init(void) {
-    ctl_start();
     rec_start();
-    const char *e = getenv("DM_KEYS"); if (!e || !*e) return;
-    if (e[0] == '@') {
-        char *text = keys_file(e + 1); if (!text) { LOG("[RED] DM_KEYS: cannot read %s", e + 1); return; }
-        keys_parse(text); free(text);
-    } else keys_parse(e);
-    if (keys_framed()) { atomic_store(&g_sync_on, 1); LOG("DM_KEYS: %d steps, all in frames: applied at the game's input reads of their frames", g_nsteps); return; }
-    pthread_t th; if (g_nsteps && !pthread_create(&th, NULL, keys_main, NULL)) { pthread_detach(th); LOG("DM_KEYS: %d steps", g_nsteps); }
+    const char *e = getenv("DM_KEYS");
+    if (e && *e) {
+        if (e[0] == '@') {
+            char *text = keys_file(e + 1);
+            if (text) { keys_parse(text); free(text); } else LOG("[RED] DM_KEYS: cannot read %s", e + 1);
+        } else keys_parse(e);
+        if (keys_framed()) { atomic_store(&g_sync_on, 1); LOG("DM_KEYS: %d steps, all in frames: applied at the game's input reads of their frames", g_nsteps); }
+        else if (g_nsteps) {
+            pthread_t th; atomic_store(&g_legacy_keys_on, 1);
+            if (!pthread_create(&th, NULL, keys_main, NULL)) { pthread_detach(th); LOG("DM_KEYS: %d steps", g_nsteps); }
+            else atomic_store(&g_legacy_keys_on, 0);
+        }
+    }
+    // Do not let DM_CTL replace a timeline while startup is still parsing it.
+    ctl_start();
 }
 
-// DM_CTL=<file> (Mac, for driving a game step by step from a shell): the host reads the lines appended to the file (polled every 100 ms) and acts on each at once:
+// DM_CTL=<file> (Mac, for driving a game step by step from a shell): the host reads the lines appended to the file (polled every 100 ms; DM_CTL_POLL_US=1000..1000000 overrides at startup) and acts on each at once:
 //   "key[+key][~hold]" presses as a DM_KEYS step does (hold 0.15 s by default), "shot <path>" saves the next presented frame as a PNG (dm_gfx_shot_at), "passdump <n>" dumps the
 //   render passes of the next n frames as DM_NVN_PASSDUMP does (to stderr, the run's log), "texdump <path with %d>" saves the colour targets of the next frame as DM_NVN_TEXDUMP does,
 //   "env KEY=VALUE" sets a switch read at the time of use (DM_NVN_SNAPRAW for the next texdump), "cvarf <main offset> <value>" sets an Unreal float console variable
@@ -227,9 +500,21 @@ void hid_keys_init(void) {
 //   address (nvn_mtl.m dm_gfx_addr_note: its memory pool, a texture's storage, a recorded GPU write, the raw memory table, a sparse pool's page), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
 //   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "#…" is ignored.
+//   "replay <timeline> <ack> [health=<hex-address>:<u32-threshold>]" atomically replaces a frame-only timeline, relative to current frame+1;
+//   entries are f<start>:<keys>~f<positive-hold>, ordered and nonoverlapping, no repeats. A blank keys field is neutral. Paths must be absolute, without whitespace.
+//   "replay_status <ack>", "replay_cancel <ack>" write atomic JSON ACKs. Guard failures release input (death / guard_read_error); legacy seconds scripts cannot coexist.
+//   "replay_observe <request> <ack>" reads lines "hex-address decimal-byte-count": at most 128 reads, 4096 bytes/read, 64 KiB total, each with hex bytes or an explicit read error.
+//   Observe is not a frozen snapshot: current_frame and observed_frame_end bracket the reads. No command writes guest memory.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
+static useconds_t ctl_poll_us(const char *value) {
+    uint64_t interval;
+    if (!value || !*value) return 100000;
+    if (replay_uint(value, 10, &interval) && interval >= 1000 && interval <= 1000000) return (useconds_t)interval;
+    LOG("[RED] DM_CTL_POLL_US: expected integer 1000..1000000; using 100000"); return 100000;
+}
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
+    const useconds_t poll_us = ctl_poll_us(getenv("DM_CTL_POLL_US"));
     if (getenv("DM_PREV_PROGRAM") || getenv("DM_RELAUNCH")) {   // oe::ExecuteProgram or oe::RequestToRelaunchApplication started this program in the last one's place: that program acted on what the file holds
         FILE *f0 = fopen(path, "r"); if (f0) { if (!fseek(f0, 0, SEEK_END)) off = ftell(f0); fclose(f0); }
     }
@@ -240,6 +525,7 @@ static void *ctl_main(void *arg) {
                 size_t n = strlen(line); if (!n || line[n - 1] != '\n') break;   // a line still being written: read it next time
                 off += (long)n; line[--n] = 0; if (n && line[n - 1] == '\r') line[--n] = 0;
                 if (!n || line[0] == '#') continue;
+                if (replay_command(line)) continue;
                 if (!strcmp(line, "dump")) { crash_dump_now("DM_CTL dump"); continue; }
                 if (!strncmp(line, "atrace ", 7)) { void probe_atrace(uint64_t lo, uint64_t n); char *e2; uint64_t a = strtoull(line + 7, &e2, 16); probe_atrace(a, strtoull(e2, NULL, 0)); continue; }   // probe.c
                 if (!strncmp(line, "program ", 8)) { void dm_oe_execute(int index, const void *param, size_t n); LOG("DM_CTL: oe::ExecuteProgram(%d)", atoi(line + 8)); dm_oe_execute(atoi(line + 8), NULL, 0); continue; }
@@ -261,6 +547,7 @@ static void *ctl_main(void *arg) {
                 if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1); } continue; }
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
+                if (atomic_load_explicit(&g_replay_on, memory_order_acquire)) { LOG("[RED] DM_CTL: cancel the replay before sending manual input"); continue; }
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
                     float x0, y0, x1, y1, s = 0.3f; if (sscanf(line + 5, "%f %f %f %f %f", &x0, &y0, &x1, &y1, &s) < 4) { LOG("[RED] DM_CTL drag wants x0 y0 x1 y1 [seconds]"); continue; }
                     int n = (int)(s / 0.008f); if (n < 2) n = 2;
@@ -277,7 +564,7 @@ static void *ctl_main(void *arg) {
             }
         }
         if (f) fclose(f);
-        usleep(100000);
+        usleep(poll_us);
     }
     return NULL;
 }
