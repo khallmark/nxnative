@@ -342,6 +342,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** native tests cover guarded position reads, token conflicts, invalid replacement, camera skew, same-frame caching, terminal precedence and concurrent replacement. Synthetic 30/60 Hz plants, including a hypothetical deadzone, test braking; they do not establish live terrain/deadzone behavior. Jump and waypoint-transition timing still use presented frames.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), while returning from the sword checkpoint toward the village.
 
+### A successful navigation trial waits before retrying
+
+- **Symptom:** the player reaches the waypoint and stands still for many seconds before an apparently slow reset.
+- **Cause:** survival evaluation deliberately continues to its fixed horizon after stable objective arrival. In one forest run, the first logged target proximity was at frame 121–122, but every completed attempt ran to frame 600; the actual warm restore was subsecond.
+- **Fix:** opt-in `stop_on_objective` ends navigation qualification after the existing confirmed 3D stability criterion and a verified cancellation acknowledgement. Death, completed horizons and living UI retain precedence; cleanup failure cannot publish fitness. Successful objective results reward earlier arrival. Survival mode remains the default, and the option belongs to the experiment fingerprint. First confirmed arrival is logged in both modes so idle horizon time and reset latency can be measured separately.
+- **Check:** episode tests cover default survival, early objective termination, terminal/cancellation races, invalid acknowledgements and cleanup failures. Score tests distinguish faster successful navigation from longer survival. See [whole-attempt evolution](../evolution.md#native-whole-attempt-evolution).
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), during forest target-feedback qualification.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

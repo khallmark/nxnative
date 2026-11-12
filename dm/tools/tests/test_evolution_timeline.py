@@ -46,6 +46,42 @@ class TimelineTests(unittest.TestCase):
         self.assertTrue(s.success);self.assertEqual(s.finish('objective')['damage'],1)
         self.assertTrue(s.finish('objective')['success'])
 
+
+    def test_objective_reward_prefers_early_arrival_over_waiting_and_failure(self):
+        def arrival(at):
+            score=EpisodeScore((0,0,0),(10,0,0),100)
+            score.observe(0,(0,0,0),10)
+            for frame in range(at-3,at+1):score.observe(frame,(10,0,0),10)
+            return score
+        fast=arrival(10);slow=arrival(70)
+        fast.terminal(80,10)
+        self.assertEqual(fast.objective_frame,10)
+        self.assertGreater(fast.finish('objective')['score'],slow.finish('objective')['score'])
+        self.assertEqual(fast.finish('objective')['score'],100*101+90)
+        fail=EpisodeScore((0,0,0),(10,0,0),100)
+        fail.observe(100,(9.999,0,0),10)
+        self.assertGreater(arrival(100).finish('objective')['score'],fail.finish('horizon')['score'])
+        self.assertEqual(fast.finish('horizon')['score'],100*101+80)
+        self.assertIsNone(fail.finish('horizon')['objective_frame'])
+        for reason,health in [('death',0),('horizon',10)]:
+            raced=arrival(10);raced.terminal(100,health)
+            result=raced.finish(reason,stop_on_objective=True)
+            self.assertFalse(result['success']);self.assertEqual(result['objective_frame'],10)
+            self.assertLess(result['score'],arrival(100).finish('objective',stop_on_objective=True)['score'])
+            self.assertTrue(raced.finish(reason)['success'])
+
+    def test_objective_stability_uses_all_three_axes_and_distinct_frames(self):
+        score=EpisodeScore((0,0,0),(10,0,0),100)
+        score.observe(0,(0,0,0),10)
+        for frame in range(1,8):score.observe(frame,(10,1,0),10)
+        self.assertFalse(score.success)
+        for _ in range(6):score.observe(8,(10,0,0),10)
+        self.assertFalse(score.success)
+        for frame in (9,10,11):score.observe(frame,(10,0,0),10)
+        self.assertEqual(score.objective_frame,11)
+        score.observe(12,(10,0,0),10)
+        self.assertEqual(score.objective_frame,11)
+
     def test_invalid_or_reversed_observations_are_not_scored(self):
         s=EpisodeScore((0,0,0),(1,0,0),600);s.observe(5,(0,0,0),12)
         for frame,position,hp in [(4,(0,0,0),12),(6,(float('nan'),0,0),12),(6,(0,0,0),-1)]:

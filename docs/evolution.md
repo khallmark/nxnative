@@ -47,7 +47,7 @@ per gene and sigma 0.12 of its range. Selection follows a complete generation
 with at least four candidates and two interleaved evaluations each; each death
 is persisted immediately, while offspring are selected at generation boundaries.
 
-Damage, falls, brief lack of movement and reaching the target do not end native
+By default, damage, falls, brief lack of movement and reaching the target do not end native
 attempts. They continue until a native zero-health guard or the fixed horizon.
 A horizon is a **censored survival observation**, never a death. Best observed
 3D distance gives progress bins 0–99; three successive increasing-frame samples
@@ -56,6 +56,25 @@ Fitness is `progress_bin * (horizon_frames + 1) + alive_frames`: progress outran
 passive survival, then longer survival wins within a bin. Positional stability
 is not an engine grounded-state flag. Objectives, transitions and completion
 flags still need game-specific validation.
+
+For navigation qualification, set `stop_on_objective` to `true` in the objective
+JSON. Once the same stable 3D arrival is confirmed, the evaluator cancels input
+and verifies the terminal acknowledgement before recording `reason: objective`.
+Native death, horizon completion and living UI interruptions retain precedence;
+failed cancellation or lethal-hook cleanup receives no fitness. Successful
+objective termination uses `horizon_frames - objective_frame` as the time reward,
+where `objective_frame` is the first confirmed stable-arrival frame,
+so earlier arrival wins within the success bin. In this mode only a verified
+objective termination earns the success bin; a death or completed-horizon race
+retains its terminal reason and arrival evidence but remains below that bin.
+The default is `false`; survival trials still continue after arrival and retain
+their original scoring.
+This option changes the experiment identity and requires a fresh output folder.
+
+The evaluator logs the first confirmed objective frame and elapsed time in both
+modes. Separate this post-arrival waiting time from reset latency: a controller
+can spend most of a fixed-horizon trial standing at its goal even when the
+following checkpoint restore takes only a fraction of a second.
 
 The session additionally needs `recovery.death_steps`, starting in positively
 observed `game_over` and finishing in `gameplay`. The ordinary checkpoint Load

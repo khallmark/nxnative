@@ -82,7 +82,7 @@ class EpisodeScore:
         if self.initial_distance<=tolerance:raise ValueError('Episode must start outside the objective tolerance')
         self.best_distance=self.initial_distance;self.last_position=self.start
         self.last_frame=0;self.health=None;self.damage=0;self.samples=0
-        self.stable=0;self.success=False;self.tolerance=tolerance
+        self.stable=0;self.success=False;self.tolerance=tolerance;self.objective_frame: int|None=None
 
     def observe(self,frame,position,health):
         if type(frame) is not int or frame<self.last_frame or len(position)!=3 or not all(math.isfinite(v) and abs(v)<1e6 for v in position) or type(health) is not int or not 0<=health<=2**32-1:
@@ -91,6 +91,7 @@ class EpisodeScore:
         if self.health is not None:self.damage+=max(0,self.health-health)
         if frame>self.last_frame:
             self.stable=self.stable+1 if health>0 and math.dist(position,self.target)<=self.tolerance and math.dist(position,self.last_position)<=.05 else 0
+            if self.stable>=3 and not self.success:self.objective_frame=frame
             self.success=self.success or self.stable>=3
         self.last_frame=frame;self.last_position=tuple(position);self.health=health;self.samples+=1
 
@@ -101,15 +102,22 @@ class EpisodeScore:
         if self.health is not None:self.damage+=max(0,self.health-health)
         self.last_frame=frame;self.health=health;self.samples+=1
 
-    def finish(self,reason) -> dict[str,Any]:
+    def finish(self,reason,*,stop_on_objective=False) -> dict[str,Any]:
         if reason not in ('death','horizon','objective') or not self.samples:
             raise ValueError('Only measured terminal episodes receive fitness')
         if reason=='death' and self.health!=0:raise ValueError('Death requires observed zero health')
         if reason=='objective' and not self.success:raise ValueError('Objective was not stably observed')
         progress=max(0.,min(1.,1-self.best_distance/self.initial_distance))
-        progress_bin=100 if self.success else min(99,int(progress*100))
+        success=self.success and (not stop_on_objective or reason=='objective')
+        progress_bin=100 if success else min(99,int(progress*100))
         alive=min(self.last_frame,self.horizon)
-        return dict(success=self.success,reason=reason,score=progress_bin*(self.horizon+1)+alive,
+        # Objective qualification rewards the first confirmed arrival. Survival
+        # retains its original longer-life tie-break, including after arrival.
+        bonus=alive
+        if reason=='objective':
+            if self.objective_frame is None:raise ValueError('Missing stable objective frame')
+            bonus=self.horizon-min(self.objective_frame,self.horizon)
+        return dict(success=success,reason=reason,score=progress_bin*(self.horizon+1)+bonus,
                     progress=progress,progress_bin=progress_bin,best_distance=self.best_distance,
                     alive_frames=alive,damage=self.damage,health=self.health,samples=self.samples,
-                    censored=reason=='horizon',position=self.last_position)
+                    censored=reason=='horizon',position=self.last_position,objective_frame=self.objective_frame)

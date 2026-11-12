@@ -239,12 +239,31 @@ both approximately 60.2 seconds. These observations distinguish steady rendering
 cost from the subsecond player reset and motivate native position feedback.
 
 The optional [target-feedback policy](../../../docs/evolution.md#native-target-feedback-genes)
-is implemented and covered by synthetic tests; live qualification remains open.
-It steers toward a goal and brakes by horizontal distance without changing button
-or segment-transition timing. Historical stairs coordinates were runner targets,
-not a three-frame quiet-ground proof. A new walking pilot must validate target
-XZ, health and quiet position, including actual terrain Y, before using that
-point in a fresh fitness experiment. No new quest, boss or ending is implied.
+passed a walking-only live qualification at the saved forest checkpoint. The
+pilot measured a quiet terrain position, verified health 6, cancelled input and
+restored the checkpoint before constructing a fresh 1,024-gene experiment.
+Three different candidates then achieved stable 3D arrival with no damage;
+these were interleaved candidates, not repeatability trials of one policy.
+Each ran 600 frames in 19.07–19.45 seconds. Four warm starting restores measured
+167.73–280.20 ms; cold preparation took 7.588 seconds. All fourteen save hashes
+remained unchanged. No new quest, boss or ending is implied.
+
+The first logged target proximity occurred at frame 121–122, leaving about
+15.2–15.5 seconds until the horizon. Sparse logs do not establish the exact
+first stable-success time. The inferred inter-attempt gaps were 230.44 and
+286.35 ms, including restores of 223.39 and 280.20 ms. This distinguishes
+[post-arrival horizon waiting](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying)
+from actual reset latency. The opt-in objective termination mode needs separate
+live timing; no measured improvement from that mode is claimed here yet.
+
+The fourth candidate crashed with SIGBUS: PC and fault address were
+`main+0x4cbf040`, the `GetTlsValue` import slot, with LR `main+0x49dea4`
+in the health-update function containing the optional lethal hooks. Bounded
+disassembly matches the saved scratch registers to the import thunk and SDK
+TLS patch, but does not establish why execution jumped into that data slot. The exact candidate, timeline,
+database and process logs were retained. The trainer's later communication
+errors followed host loss. Repeated natural-death recovery and long-running
+stability with the instrumentation remain open.
 
 ## Open
 
@@ -284,6 +303,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [A successful navigation trial waits before retrying](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying): the forest trials spent about fifteen seconds after first logged target proximity before their fixed horizon; explicit objective termination separates navigation speed from survival evaluation.
 - [Timed movement overshoots when presented frames slow down](../../../docs/reference/services.md#timed-movement-overshoots-when-presented-frames-slow-down): guarded native target steering adds position feedback and braking; live terrain/deadzone qualification remains separate from the synthetic model.
 - [Item dialogue interrupts a native training episode](../../../docs/reference/services.md#item-dialogue-interrupts-a-native-training-episode): the sword acquisition exposed a lifecycle interruption distinct from warm reset latency. The opt-in `--resident-handoff` retains the winning candidate and attachment while a supervisor handles the dialogue; it does not classify unknown UI as success or resume an obsolete objective.
 - [Live scripted actions wait for every observation](../../../docs/reference/services.md#live-scripted-actions-wait-for-every-observation): a native frame-timeline backend for the genetic trainer removes Python from per-action input. In the first whole-attempt Mac pilot, 7,200 frames took 132.166 s (54.477 frames/s), with two damage units and no objective success; the horizon is censored, not a death. The normal checkpoint reset took 13.679 s and the next mutated candidate started automatically. Twenty native observations had median turnaround 1.988 ms; this is transport latency, not a whole-game acceleration factor. Actual native death/recovery, accelerated-clock fidelity and full-game completion remain unverified. Earlier normal-input death calibration reached Game Over and Try Again; only option metadata changed on Continue. The HUD remains visible at Game Over, so zero health cannot count as gameplay.
