@@ -163,7 +163,18 @@ that drift. Earlier accepted resets moved 0.045 units within their acceptance
 window. The candidate now also requires consecutive-frame position and maximum
 rotation-element changes of at most 0.005; duplicate and skipped frames cannot
 manufacture a stationary proof. The existing anchor/health bounds and post-warp
-60-frame deadline remain. The two-stage change is under live validation.
+60-frame deadline remain. The two-stage change passed the same nine-movement plus final-reset preflight
+on a fresh process. The final proof requested Wait at frame 8235, warped at 8236,
+and accepted three consecutive low-motion samples ending at 8242. Final position
+was 0.061 units from the anchor, inside the configured 0.3 tolerance, with health
+10. Warm preflight restores took 106.6–177.0 ms. The same attachment then entered
+continuous 600-frame qualification: twelve ordinary trials and thirteen starting
+resets measured median 126.23 ms (103.80–161.27 ms range), with matching health and
+motion proofs and all 14 save hashes unchanged. Initial preparation took 10.309 s
+and is excluded. End-to-end throughput was 5.684 attempts/minute, compared with
+2.533 using normal loads at the same horizon. This measures retries and bounded
+qualification, not simulation acceleration or a natural-death cycle in this new
+candidate. No unload/re-attachment occurred between preflight and training.
 
 After that failed pilot, both script unload calls timed out despite restored
 instruction bytes and a successful completed-state snapshot. The cause remains
@@ -183,8 +194,10 @@ global was proved; this is calibrated for ordinary gameplay, not cutscenes.
 Standalone X input produced a measured 0.62-unit jump arc with unchanged health;
 A as dash and Y as attack remain unverified. Three 12-frame world-direction
 trials spanning 106.8 degrees of camera yaw had 4.05 degrees of movement-heading
-spread and 0.0742 units of endpoint spread, with unchanged health. The subsequent
-no-button/A/B pairs did not establish a reliable speed-only gain. A six-second
+spread and 0.0742 units of endpoint spread, with unchanged health. The first no-button/A/B pairs were confounded by resumed movement after reset.
+Repeating them after the two-stage correction kept headings near -39 degrees:
+A increased 24-frame travel about 14.7 percent in both orders, while B did not.
+This establishes a short-hold movement gain, not sustained sprint/stamina behavior. A six-second
 route probe and subsequent genetic trials still have no verified target landing.
 Shorter 600-frame route qualification is explicitly censored; 7200-frame survival
 validation belongs to a separate experiment and imports genes, not fitness.
