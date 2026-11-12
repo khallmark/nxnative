@@ -230,6 +230,22 @@ item UI entering runner shutdown, followed by another cancelled Frida unload.
 All six original hook sites were readable and restored, but that does not prove
 that remote teardown completed. No new attachment was made to that process.
 
+The subsequent forest run retained the sword and used a newly saved, normal-reload
+verified checkpoint. Its timed routes overshot the village waypoint while replay
+throughput fell to roughly 28–31 presented frames/s. A read-only render sample
+measured GPU p50 28.68 ms and whole-frame p50 33.17 ms, with no new pipeline or
+shader-library build time in that sample. Game-time and wall-time intervals were
+both approximately 60.2 seconds. These observations distinguish steady rendering
+cost from the subsecond player reset and motivate native position feedback.
+
+The optional [target-feedback policy](../../../docs/evolution.md#native-target-feedback-genes)
+is implemented and covered by synthetic tests; live qualification remains open.
+It steers toward a goal and brakes by horizontal distance without changing button
+or segment-transition timing. Historical stairs coordinates were runner targets,
+not a three-frame quiet-ground proof. A new walking pilot must validate target
+XZ, health and quiet position, including actual terrain Y, before using that
+point in a fresh fitness experiment. No new quest, boss or ending is implied.
+
 ## Open
 
 - Root cause confirmed on M4 Pro (2026-11-08): [ignored event waits](../../../docs/reference/nvn-objects.md#gpu-event-waits-order-work-across-queues) let lighting consumers run before their producers. The game issues about 25 waits and 19 signals per frame. All 297 complete traced frames submit queue 5's ambient-cache consumer `9e6b00b050e30801` before queue 1's SH producer `21d9f83e6027c565`, despite the explicit dependency. Queue 1 also waits for the CPU frame-ready event after the CPU clears the lighting buffer. At frame 3872 the consumer ran at 0.686 ms, the clear at 0.966–0.968 ms, and the producer at 1.282 ms; its release followed at 4.467 ms. Exposure writer `1bba09ec4bc8ff67` has another event dependency. The native SDK's flush/invalidate functions are no-ops for these coherent pools.
@@ -268,6 +284,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [Timed movement overshoots when presented frames slow down](../../../docs/reference/services.md#timed-movement-overshoots-when-presented-frames-slow-down): guarded native target steering adds position feedback and braking; live terrain/deadzone qualification remains separate from the synthetic model.
 - [Item dialogue interrupts a native training episode](../../../docs/reference/services.md#item-dialogue-interrupts-a-native-training-episode): the sword acquisition exposed a lifecycle interruption distinct from warm reset latency. The opt-in `--resident-handoff` retains the winning candidate and attachment while a supervisor handles the dialogue; it does not classify unknown UI as success or resume an obsolete objective.
 - [Live scripted actions wait for every observation](../../../docs/reference/services.md#live-scripted-actions-wait-for-every-observation): a native frame-timeline backend for the genetic trainer removes Python from per-action input. In the first whole-attempt Mac pilot, 7,200 frames took 132.166 s (54.477 frames/s), with two damage units and no objective success; the horizon is censored, not a death. The normal checkpoint reset took 13.679 s and the next mutated candidate started automatically. Twenty native observations had median turnaround 1.988 ms; this is transport latency, not a whole-game acceleration factor. Actual native death/recovery, accelerated-clock fidelity and full-game completion remain unverified. Earlier normal-input death calibration reached Game Over and Try Again; only option metadata changed on Continue. The HUD remains visible at Game Over, so zero health cannot count as gameplay.
 - [Draw passes that wait for each other again while images share memory](../../../docs/reference/frame-rate.md#draw-passes-that-wait-for-each-other-again-while-images-share-memory): resolved, `draw_barriers game` was off whenever family heaps existed, and fragment-only barriers forced full ones; M1 Max gameplay frame 23.4 → 21.7 ms.

@@ -9,31 +9,43 @@ from .live import Bridge,TrialStopped
 
 
 _WORLD_FIELDS=('rotation_address','guard1_address','guard1_value','guard2_address','guard2_value')
+_POSITION_FIELDS=('position_address','guard1_address','guard1_value','guard2_address','guard2_value')
+
+
+def _validate_binding(binding,fields,size,kind):
+    """Freeze generic memory addresses/identities without guessing game offsets."""
+    if binding is None:return None
+    if not isinstance(binding,dict) or set(binding)!=set(fields):
+        raise ValueError('Invalid native '+kind+' binding')
+    result={}
+    for name in fields:
+        value=binding[name]
+        if not isinstance(value,str) or not re.fullmatch(r'0x[0-9a-fA-F]{1,16}',value):
+            raise ValueError('Invalid native '+kind+' '+name)
+        number=int(value,16)
+        if name.endswith('_address'):
+            length,alignment=(size,4) if name==fields[0] else (8,8)
+            if not 0<number<=2**64-1-length or number%alignment:
+                raise ValueError('Invalid native '+kind+' '+name)
+        result[name]=f'0x{number:x}'
+    return result
 
 
 def validate_world_xz(binding):
-    """Freeze generic camera addresses/identities without guessing game offsets."""
-    if binding is None:return None
-    if not isinstance(binding,dict) or set(binding)!=set(_WORLD_FIELDS):
-        raise ValueError('Invalid native world-X/Z camera binding')
-    result={}
-    for name in _WORLD_FIELDS:
-        value=binding[name]
-        if not isinstance(value,str) or not re.fullmatch(r'0x[0-9a-fA-F]{1,16}',value):
-            raise ValueError('Invalid native world-X/Z '+name)
-        number=int(value,16)
-        if name.endswith('_address'):
-            size,alignment=(36,4) if name=='rotation_address' else (8,8)
-            if not 0<number<=2**64-1-size or number%alignment:
-                raise ValueError('Invalid native world-X/Z '+name)
-        result[name]=f'0x{number:x}'
-    return result
+    return _validate_binding(binding,_WORLD_FIELDS,36,'world-X/Z camera')
+
+
+def validate_position_xyz(binding):
+    return _validate_binding(binding,_POSITION_FIELDS,12,'player-position')
 
 
 class ReplayBridge(Bridge):
     def __init__(self,config):
         self.native_status={};self.episode_epoch=None;self.owns_replay=False
         self.world_xz=validate_world_xz(config.get('native_world_xz'))
+        self.position_xyz=validate_position_xyz(config.get('native_position_xyz'))
+        if self.position_xyz is not None and self.world_xz is None:
+            raise ValueError('Native player-position binding requires a world-camera binding')
         self.fps=config.get('replay_fps',60)
         if type(self.fps) is not int or not 1<=self.fps<=240:raise ValueError('Invalid guest replay FPS')
         super().__init__(config)
@@ -61,8 +73,11 @@ class ReplayBridge(Bridge):
         finally:
             ack.unlink(missing_ok=True)
 
-    def start_replay(self,timeline,health_address=None,threshold=0,episode=True):
+    def start_replay(self,timeline,health_address=None,threshold=0,episode=True,target_feedback=False):
         if self.episode_epoch is not None:raise TrialStopped('A native episode already owns input')
+        if type(target_feedback) is not bool:raise ValueError('Invalid target-feedback mode')
+        if target_feedback and (not episode or self.world_xz is None or self.position_xyz is None):
+            raise ValueError('Target feedback requires an episode with world and position bindings')
         path=self.root/(uuid.uuid4().hex+'.keys')
         try:
             path.write_text(timeline)
@@ -74,6 +89,9 @@ class ReplayBridge(Bridge):
             binding=self.world_xz if episode else None
             if binding is not None:
                 guard+=('world_xz='+':'.join(binding[name][2:] for name in _WORLD_FIELDS),)
+            position=self.position_xyz if target_feedback else None
+            if position is not None:
+                guard+=('position_xyz='+':'.join(position[name][2:] for name in _POSITION_FIELDS),)
             result=self.rpc('replay',(path,),guard)
             self.owns_replay=True
             if binding is not None:
@@ -81,6 +99,16 @@ class ReplayBridge(Bridge):
                     raise TrialStopped('Native replay did not acknowledge world-X/Z camera binding')
             elif result.get('left_stick_space','camera')!='camera' or result.get('world_xz') is not None:
                 raise TrialStopped('Native replay unexpectedly changed left-stick coordinates')
+            if target_feedback:
+                frame=result.get('last_position_frame');observed=result.get('last_position')
+                if (result.get('movement_mode')!='target_feedback' or result.get('position_xyz')!=position or
+                    type(frame) is not int or not 0<=frame<=result['current_frame'] or
+                    (observed is None and frame!=0) or
+                    (observed is not None and (not isinstance(observed,list) or len(observed)!=3 or
+                     any(type(v) not in (int,float) or not math.isfinite(v) or abs(v)>=1e6 for v in observed)))):
+                    raise TrialStopped('Native replay did not acknowledge target-feedback position binding')
+            elif result.get('movement_mode','timeline')!='timeline' or result.get('position_xyz') is not None:
+                raise TrialStopped('Native replay unexpectedly enabled target feedback')
             if episode:self.episode_epoch=result['epoch']
             return result
         finally:

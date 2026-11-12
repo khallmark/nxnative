@@ -217,17 +217,22 @@ static char *keys_file(const char *path) {
 // DM_CTL replay timelines are relative, integral frames. Parse into private storage,
 // then replace the current replay under g_sync_mu; the game never sees a partial list.
 // This vector is separate from DM_KEYS, whose seconds thread owns g_steps until exit.
-typedef struct { uint64_t at, end; key_step input; } replay_step;
+typedef struct { int enabled; float xyz[3], strength, stop_radius, slow_radius; } replay_target;
+typedef struct { uint64_t at, end; key_step input; replay_target target; } replay_step;
 // Optional generic camera binding: two caller-supplied identity words and a
 // row-major rotation matrix. The host owns no game offsets or camera discovery.
 typedef struct {
     uint64_t rotation_address, guard1_address, guard1_value, guard2_address, guard2_value;
 } replay_camera;
 typedef struct {
+    uint64_t position_address, guard1_address, guard1_value, guard2_address, guard2_value;
+} replay_position;
+typedef struct {
     replay_step *steps; size_t count, next; int64_t applied;
     uint64_t epoch, start, end, last_frame, stop_frame, guard_address;
     uint32_t guard_threshold, last_health; int health_valid;
     replay_camera camera; uint64_t camera_frame; float camera_basis[4];
+    replay_position position; uint64_t position_frame; float last_position[3]; int target_feedback;
     const char *reason;
 } replay_state;
 static replay_state g_replay = {.applied = -1, .reason = "idle"};
@@ -250,8 +255,22 @@ static int replay_pair(const char *s, char separator, float low, float high, flo
     if (end == second || errno || *end || !isfinite(b) || b < low || b > high) return 0;
     *x = a; *y = b; return 1;
 }
+static int replay_target_parse(const char *text, replay_target *target) {
+    float values[6]; const char *next = text;
+    for (int i = 0; i < 6; i++) {
+        char *end; errno = 0; values[i] = strtof(next, &end);
+        if (end == next || errno || !isfinite(values[i]) || (i < 5 ? *end != '/' : *end != 0)) return 0;
+        next = end + (i < 5);
+    }
+    for (int i = 0; i < 3; i++) if (fabsf(values[i]) >= 1e6f) return 0;
+    if (values[3] < 0 || values[3] > 1 || values[4] < 0 || values[4] >= values[5] || values[5] > 1000) return 0;
+    *target = (replay_target){.enabled = 1, .xyz = {values[0], values[1], values[2]},
+        .strength = values[3], .stop_radius = values[4], .slow_radius = values[5]};
+    return 1;
+}
 // Strict version of parse_keys: unknown/partial tokens are errors, not silent neutral input.
-static int replay_keys(char *spec, key_step *st) {
+static int replay_keys(char *spec, replay_step *step) {
+    key_step *st = &step->input; int left_seen = 0;
     if (!*spec) return 1;   // an explicit neutral interval
     for (char *k = spec; k;) {
         char *plus = strchr(k, '+'); if (plus) *plus = 0;
@@ -261,16 +280,20 @@ static int replay_keys(char *spec, key_step *st) {
         static const char *const dirs[] = {"LLeft", "LUp", "LRight", "LDown", "RLeft", "RUp", "RRight", "RDown"};
         for (int d = 0; d < 8; d++) if (!strcasecmp(k, dirs[d])) {
             int32_t *axis = d < 4 ? (d & 1 ? &st->ly : &st->lx) : (d & 1 ? &st->ry : &st->rx);
-            *axis = (d % 4 == 0 || d % 4 == 3) ? -32767 : 32767; found = 1; break;
+            *axis = (d % 4 == 0 || d % 4 == 3) ? -32767 : 32767; if (d < 4) left_seen = 1; found = 1; break;
+        }
+        if (!found && k[0] == 'G') {
+            if (step->target.enabled || !replay_target_parse(k + 1, &step->target)) return 0;
+            found = 1;
         }
         float x, y;
         if (!found && (k[0] == 'L' || k[0] == 'R') && replay_pair(k + 1, '/', -1, 1, &x, &y)) {
-            if (k[0] == 'L') { st->lx = (int32_t)lrintf(x * 32767); st->ly = (int32_t)lrintf(y * 32767); }
+            if (k[0] == 'L') { left_seen = 1; st->lx = (int32_t)lrintf(x * 32767); st->ly = (int32_t)lrintf(y * 32767); }
             else { st->rx = (int32_t)lrintf(x * 32767); st->ry = (int32_t)lrintf(y * 32767); } found = 1;
         }
         if (!found && (k[0] == 'T' || k[0] == 't') && replay_pair(k + 1, 'x', 0, 1, &x, &y)) { st->tap = 1; st->tx = x; st->ty = y; found = 1; }
         if (!strcasecmp(k, "Shake")) { st->btn |= DM_BTN_SHAKE; found = 1; }
-        if (!found || (plus && !plus[1])) return 0;
+        if (!found || (left_seen && step->target.enabled) || (plus && !plus[1])) return 0;
         k = plus ? plus + 1 : NULL;
     }
     return 1;
@@ -300,7 +323,7 @@ static replay_step *replay_parse(char *text, size_t *count, const char **error) 
         if (duration > UINT64_MAX - at) { *error = "frame_overflow"; goto fail; }
         if (n && at < steps[n - 1].end) { *error = "overlap"; goto fail; }
         replay_step one = {.at = at, .end = at + duration};
-        if (!replay_keys(colon + 1, &one.input)) { *error = "key_syntax"; goto fail; }
+        if (!replay_keys(colon + 1, &one)) { *error = "key_syntax"; goto fail; }
         if (n == KEY_STEPS) { *error = "step_limit"; goto fail; }
         if (n == capacity) {
             size_t cap = capacity ? capacity * 2 : 64; replay_step *p = realloc(steps, cap * sizeof *p);
@@ -337,6 +360,29 @@ static const char *replay_camera_read(const replay_camera *camera, float basis[4
     basis[2] = -r[2] / fn; basis[3] = -r[8] / fn;
     if (fabsf(basis[0] * basis[3] - basis[1] * basis[2]) < .01f) return "camera_basis_error";
     return NULL;
+}
+// Like the camera binding, position identities bracket a safe copy. This is
+// finite telemetry, not a collision/ground-contact or atomic-world guarantee.
+static const char *replay_position_read(const replay_position *position, float xyz[3]) {
+    uint64_t first, second;
+    if (!replay_read(position->guard1_address, sizeof first, &first) ||
+        !replay_read(position->guard2_address, sizeof second, &second)) return "position_read_error";
+    if (first != position->guard1_value || second != position->guard2_value) return "position_identity_error";
+    if (!replay_read(position->position_address, 3 * sizeof(float), xyz) ||
+        !replay_read(position->guard1_address, sizeof first, &first) ||
+        !replay_read(position->guard2_address, sizeof second, &second)) return "position_read_error";
+    if (first != position->guard1_value || second != position->guard2_value) return "position_identity_error";
+    for (int i = 0; i < 3; i++) if (!isfinite(xyz[i]) || fabsf(xyz[i]) >= 1e6f) return "position_value_error";
+    return NULL;
+}
+static float replay_target_axes(const replay_target *target, const float position[3], key_step *input) {
+    float x = target->xyz[0] - position[0], z = target->xyz[2] - position[2], distance = hypotf(x, z);
+    float strength = target->strength * fminf(1.f, fmaxf(0.f,
+        (distance - target->stop_radius) / (target->slow_radius - target->stop_radius)));
+    input->lx = distance > 0 ? (int32_t)lrintf(x / distance * strength * 32767) : 0;
+    input->ly = distance > 0 ? (int32_t)lrintf(z / distance * strength * 32767) : 0;
+    // Y is retained in the target, but horizontal stopping never proves arrival.
+    return strength;
 }
 static int replay_world_axes(const key_step *step, const float basis[4], int32_t *lx, int32_t *ly) {
     float wx = step->lx / 32767.f, wz = step->ly / 32767.f;
@@ -430,12 +476,26 @@ static int replay_sync(void) {
         if (error) { replay_stop_locked(error); goto done; }
         g_replay.camera_frame = frame; camera_updated = 1;
     }
+    int position_updated = 0;
+    if (selected >= 0 && g_replay.steps[selected].target.enabled && frame != g_replay.position_frame) {
+        float xyz[3]; const char *error = replay_position_read(&g_replay.position, xyz);
+        if (error) { replay_stop_locked(error); goto done; }
+        memcpy(g_replay.last_position, xyz, sizeof xyz); g_replay.position_frame = frame; position_updated = 1;
+    }
     int changed = selected != g_replay.applied;
-    if (selected >= 0 && (changed || camera_updated)) {
-        const key_step *s = &g_replay.steps[selected].input;
+    if (selected >= 0 && (changed || camera_updated || position_updated)) {
+        const replay_step *step = &g_replay.steps[selected]; key_step input = step->input;
+        float target_strength = step->target.enabled ? replay_target_axes(&step->target, g_replay.last_position, &input) : 0;
+        const key_step *s = &input;
         int32_t lx = s->lx, ly = s->ly;
         if (g_replay.camera.rotation_address && !replay_world_axes(s, g_replay.camera_basis, &lx, &ly)) {
             replay_stop_locked("camera_basis_error"); goto done;
+        }
+        if (step->target.enabled) {
+            // The inverse projection may amplify a nonorthogonal camera basis.
+            // G strength is a controller magnitude; preserve only that direction.
+            float length = hypotf((float)lx, (float)ly);
+            if (length > 0) { lx = (int32_t)lrintf(lx / length * target_strength * 32767); ly = (int32_t)lrintf(ly / length * target_strength * 32767); }
         }
         if (changed) {
             if (s->tap) { dm_touch touch = {0, s->tx, s->ty}; dm_touch_script(&touch, 1); }
@@ -473,6 +533,18 @@ static void replay_json(FILE *f, const char *error) {
     } else fputs("null", f);
     fprintf(f, ",\"last_camera_frame\":%llu", (unsigned long long)
             (camera->rotation_address && g_replay.camera_frame != UINT64_MAX ? g_replay.camera_frame : 0));
+    const replay_position *position = &g_replay.position;
+    fprintf(f, ",\"movement_mode\":\"%s\",\"position_xyz\":", g_replay.target_feedback ? "target_feedback" : "timeline");
+    if (position->position_address) {
+        fprintf(f, "{\"position_address\":\"0x%llx\",\"guard1_address\":\"0x%llx\",\"guard1_value\":\"0x%llx\",\"guard2_address\":\"0x%llx\",\"guard2_value\":\"0x%llx\"}",
+                (unsigned long long)position->position_address, (unsigned long long)position->guard1_address,
+                (unsigned long long)position->guard1_value, (unsigned long long)position->guard2_address,
+                (unsigned long long)position->guard2_value);
+    } else fputs("null", f);
+    int position_valid = position->position_address && g_replay.position_frame != UINT64_MAX;
+    fprintf(f, ",\"last_position_frame\":%llu,\"last_position\":", (unsigned long long)(position_valid ? g_replay.position_frame : 0));
+    if (position_valid) fprintf(f, "[%.9g,%.9g,%.9g]", g_replay.last_position[0], g_replay.last_position[1], g_replay.last_position[2]);
+    else fputs("null", f);
     pthread_mutex_unlock(&g_sync_mu);
 }
 // Reserve an adjacent temporary before mutating input. Rename publishes complete JSON.
@@ -507,22 +579,42 @@ static const char *replay_camera_parse(char *spec, replay_camera *camera) {
     *camera = (replay_camera){values[0], values[1], values[2], values[3], values[4]};
     return NULL;
 }
+static const char *replay_position_parse(char *spec, replay_position *position) {
+    if (strncmp(spec, "position_xyz=", 13)) return "position_syntax";
+    char *tail = spec + 13; uint64_t values[5];
+    for (int i = 0; i < 5; i++) {
+        char *field = strsep(&tail, ":");
+        if (!field || !replay_uint(field, 16, &values[i])) return "position_syntax";
+    }
+    if (tail || !values[0] || (values[0] & 3) || values[0] > UINT64_MAX - 3 * sizeof(float) ||
+        !values[1] || (values[1] & 7) || values[1] > UINT64_MAX - sizeof(uint64_t) ||
+        !values[3] || (values[3] & 7) || values[3] > UINT64_MAX - sizeof(uint64_t)) return "position_syntax";
+    *position = (replay_position){values[0], values[1], values[2], values[3], values[4]};
+    return NULL;
+}
 static const char *replay_install(replay_step *steps, size_t count, uint64_t address, uint32_t threshold,
-                                  const replay_camera *camera) {
+                                  const replay_camera *camera, const replay_position *position) {
     const char *error = NULL;
     pthread_mutex_lock(&g_sync_mu);
     uint64_t frame = dm_guest_frame();
     if (atomic_load_explicit(&g_legacy_keys_on, memory_order_acquire)) error = "legacy_seconds_active";
     else if (frame == UINT64_MAX || steps[count - 1].end > UINT64_MAX - (frame + 1) || g_replay.epoch == UINT64_MAX) error = "frame_overflow";
-    float basis[4];
+    int target_feedback = 0;
+    for (size_t i = 0; i < count; i++) target_feedback |= steps[i].target.enabled;
+    if (!error && target_feedback && (!camera || !position)) error = "target_binding";
+    if (!error && position && !target_feedback) error = "position_unused";
+    float basis[4], xyz[3];
     if (!error && camera) error = replay_camera_read(camera, basis);
+    if (!error && position) error = replay_position_read(position, xyz);
     if (!error) {
         uint64_t base = frame + 1, epoch = g_replay.epoch + 1;
         for (size_t i = 0; i < count; i++) { steps[i].at += base; steps[i].end += base; }
         atomic_store(&g_sync_on, 0); g_sync_held = 0; replay_release(); free(g_replay.steps);
         g_replay = (replay_state){.steps = steps, .count = count, .applied = -1, .epoch = epoch, .start = base,
             .end = steps[count - 1].end, .last_frame = UINT64_MAX, .guard_address = address, .guard_threshold = threshold,
-            .camera = camera ? *camera : (replay_camera){0}, .camera_frame = UINT64_MAX, .reason = "running"};
+            .camera = camera ? *camera : (replay_camera){0}, .camera_frame = UINT64_MAX,
+            .position = position ? *position : (replay_position){0}, .position_frame = UINT64_MAX,
+            .target_feedback = target_feedback, .reason = "running"};
         atomic_store_explicit(&g_replay_on, 1, memory_order_release);
     }
     pthread_mutex_unlock(&g_sync_mu); return error;
@@ -544,29 +636,30 @@ static const char *replay_observe_parse(char *text, replay_observation reads[REP
 // Returns 1 for any replay command, including invalid ones (never fall through to a key).
 static int replay_command(char *line) {
     if (strncmp(line, "replay", 6) || (line[6] && !isspace((unsigned char)line[6]) && line[6] != '_')) return 0;
-    char *save, *args[6]; size_t argc = 0;
-    for (char *tok = strtok_r(line, " \t", &save); tok && argc < 6; tok = strtok_r(NULL, " \t", &save)) args[argc++] = tok;
+    char *save, *args[7]; size_t argc = 0;
+    for (char *tok = strtok_r(line, " \t", &save); tok && argc < 7; tok = strtok_r(NULL, " \t", &save)) args[argc++] = tok;
     int run = argc && !strcmp(args[0], "replay"), observe = argc && !strcmp(args[0], "replay_observe");
     int cancel = argc && !strcmp(args[0], "replay_cancel"), status = argc && !strcmp(args[0], "replay_status");
     size_t ack_index = run || observe ? 2 : 1;
     if ((!run && !observe && !cancel && !status) || argc <= ack_index) { LOG("[RED] DM_CTL: malformed replay command"); return 1; }
     const char *ack = args[ack_index], *error = NULL; char tmp[PATH_MAX];
     FILE *out = replay_ack_open(ack, tmp); if (!out) { LOG("[RED] DM_CTL replay: cannot create ACK %s", ack); return 1; }
-    if (run ? (argc < 3 || argc > 5) : argc != (observe ? 3 : 2)) error = "command_syntax";
+    if (run ? (argc < 3 || argc > 6) : argc != (observe ? 3 : 2)) error = "command_syntax";
     uint64_t accepted_epoch = 0;
     replay_observation reads[REPLAY_READS_MAX]; size_t nreads = 0;
     if (!error && run) {
-        uint64_t address = 0; uint32_t threshold = 0; replay_camera camera = {0};
-        int have_guard = 0, have_camera = 0;
+        uint64_t address = 0; uint32_t threshold = 0; replay_camera camera = {0}; replay_position position = {0};
+        int have_guard = 0, have_camera = 0, have_position = 0;
         for (size_t i = 3; !error && i < argc; i++) {
             if (!strncmp(args[i], "health=", 7) && !have_guard++) error = replay_guard(args[i], &address, &threshold);
             else if (!strncmp(args[i], "world_xz=", 9) && !have_camera++) error = replay_camera_parse(args[i], &camera);
+            else if (!strncmp(args[i], "position_xyz=", 13) && !have_position++) error = replay_position_parse(args[i], &position);
             else error = "command_syntax";
         }
         if (!error && args[1][0] != '/') error = "path_syntax";
         char *text = error ? NULL : replay_file(args[1], REPLAY_FILE_MAX, &error);
         size_t count = 0; replay_step *steps = text ? replay_parse(text, &count, &error) : NULL; free(text);
-        if (steps) { error = replay_install(steps, count, address, threshold, have_camera ? &camera : NULL); if (error) free(steps); else accepted_epoch = g_replay.epoch; }
+        if (steps) { error = replay_install(steps, count, address, threshold, have_camera ? &camera : NULL, have_position ? &position : NULL); if (error) free(steps); else accepted_epoch = g_replay.epoch; }
     } else if (!error && cancel) {
         pthread_mutex_lock(&g_sync_mu); if (atomic_load(&g_replay_on)) replay_stop_locked("cancelled"); pthread_mutex_unlock(&g_sync_mu);
     } else if (!error && observe) {
@@ -630,6 +723,8 @@ void hid_keys_init(void) {
 //   "replay <timeline> <ack> [health=<hex-address>:<u32-threshold>] [world_xz=<rotation>:<guard1-address>:<guard1-u64>:<guard2-address>:<guard2-u64>]" replaces a timeline, relative to frame+1;
 //   entries are f<start>:<keys>~f<positive-hold>, ordered and nonoverlapping, no repeats. A blank keys field is neutral. Paths must be absolute, without whitespace.
 //   world_xz fields are hex: row-major float32[9] camera rotation, right=(r0,r6), forward=(-r2,-r8); Lx/y denotes world X/Z. Identity/matrix failures stop input.
+//   position_xyz=<position>:<guard1-address>:<guard1-u64>:<guard2-address>:<guard2-u64> binds float32[3] by hex addresses/identities.
+//   Gx/y/z/strength/stop/slow replaces left-stick input for that step, requires both bindings, and brakes by XZ distance each frame; Y is diagnostic, not success.
 //   "replay_status <ack>", "replay_cancel <ack>" write atomic JSON ACKs. Guard failures release input (death / guard_read_error); legacy seconds scripts cannot coexist.
 //   "replay_observe <request> <ack>" reads lines "hex-address decimal-byte-count": at most 128 reads, 4096 bytes/read, 64 KiB total, each with hex bytes or an explicit read error.
 //   Observe is not a frozen snapshot: current_frame and observed_frame_end bracket the reads. No command writes guest memory.

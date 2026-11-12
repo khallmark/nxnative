@@ -28,6 +28,7 @@ def main():
     ap.add_argument('--repeats',type=int,default=2)
     ap.add_argument('--mutation-rate',type=float,default=.1)
     ap.add_argument('--mutation-sigma',type=float,default=.12)
+    ap.add_argument('--initial-sigma',type=float,default=.35,help='Initial population mutation spread; independent of later mutation sigma')
     ap.add_argument('--seed-champion',type=Path)
     ap.add_argument('--resident-handoff',action='store_true',help='Keep the same attachment resident for explicitly guarded UI commands')
     args=ap.parse_args()
@@ -42,10 +43,11 @@ def main():
     prepared=prepare_fast_reset(config)
     package=Path(__file__).resolve().parents[1]/'dm'/'tools'/'evolution'
     implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py','reset.py','handoff.py'))])+json.dumps(config,sort_keys=True).encode()+(prepared.fingerprint() if prepared else b'')).hexdigest()
-    initial=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else seed_genome(spec.get('segments',128),spec.get('initial_direction',[0,1]))
+    policy=spec.get('policy','timeline_v1')
+    initial=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else seed_genome(spec.get('segments',128),spec.get('initial_direction',[0,1]),policy)
     evolution=Evolution(args.output/'evolution.sqlite',[spec],args.population,args.repeats,implementation=implementation,
-                        bounds=gene_space(spec.get('segments',128)),initial_genome=initial,
-                        mutation_rate=args.mutation_rate,mutation_sigma=args.mutation_sigma)
+                        bounds=gene_space(spec.get('segments',128),policy),initial_genome=initial,
+                        mutation_rate=args.mutation_rate,mutation_sigma=args.mutation_sigma,initial_sigma=args.initial_sigma)
     def interrupt(signum,frame):raise KeyboardInterrupt
     signal.signal(signal.SIGTERM,interrupt)
     bridge=None;backend=None;log=None;primary=None;cleanup_errors=[]

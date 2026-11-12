@@ -24,8 +24,9 @@ plays them at guest input reads. The default chromosome has 128 segments and
 768 real-valued genes: left-stick X/Y, dash/action A, jump X, attack Y, and hold
 frames per segment. Button genes above zero press that button. Hold genes round
 to 1–30 frames; the chromosome repeats to the declared frame horizon. Controls
-must be checked for the current game. This is an action-sequence GA, not a neural
-network or an automatically learned map.
+must be checked for the current game. The default policy is an action-sequence GA; the optional target-feedback policy
+below evolves positional goals and braking parameters. Neither is a neural network
+or an automatically learned map.
 
 ```sh
 python3 scripts/evolve_replay.py --session /game/run/native-session.json \
@@ -81,7 +82,8 @@ all files remain strict. Do not include progress/caption files merely to bypass
 a failure; such a change needs a newly verified checkpoint and experiment.
 
 The runner batches fixed telemetry and validates identities throughout attempts.
-It does not perform actor discovery or reactive steering during native timelines.
+It does not perform actor discovery or Python steering during native timelines.
+The optional target-feedback policy computes steering in the native input loop.
 A changed identity, unexpected menu, changed save, invalid native epoch, read
 error, or stalled guest frame counter interrupts evaluation without assigning
 fitness. The host releases scripted input on death, cancellation and completion;
@@ -250,6 +252,70 @@ Changing coordinate modes requires a fresh experiment. Derive a world-mode seed
 from world-space route evidence; reinterpreting old camera-relative champion genes
 changes their actions. Camera normalization does not rewind hazards or random state.
 
+### Native target-feedback genes
+
+Set the objective's `policy` to `target_feedback_v1` to evolve goals that react
+to player position. The default `timeline_v1` keeps the original stick genes.
+Feedback additionally requires `native_position_xyz` in the session, alongside
+`native_world_xz`:
+
+```json
+{
+  "native_position_xyz": {
+    "position_address": "0x6000",
+    "guard1_address": "0x7000",
+    "guard1_value": "0x8000",
+    "guard2_address": "0x9000",
+    "guard2_value": "0xa000"
+  }
+}
+```
+
+These illustrative hexadecimal addresses are not a runnable binding. Position
+points to three float32 values. Two aligned uint64 equality guards identify the
+player; the host checks them before and after each safe position read. The host
+contains no game offsets. Unreadable, changed-identity or nonfinite/out-of-range
+position data releases scripted input and interrupts scoring.
+
+Each feedback segment has eight genes, giving **1,024 genes at 128 segments**:
+
+| Gene | Bounds | Walking seed |
+| --- | --- | --- |
+| `target_dx`, `target_dz` | -8 to 8 world units relative to the objective | 0 |
+| `strength` | 0 to 1 controller magnitude | 1 |
+| `slow_radius` | 0.25 to 2 world units | 0.75 |
+| `dash`, `jump`, `attack` | -1 to 1; positive presses A, X, Y | -1 |
+| `frames` | 1 to 30 presented frames per segment | 30 |
+
+The objective's `feedback_stop_radius` defaults to 0.1, must be within 0–0.2,
+and must be below its scoring tolerance. Python compiles each segment into
+`Gx/y/z/strength/stop/slow` plus any button genes. Target X/Z include the segment's
+offsets; target Y stays the objective's Y. Fixed decimal formatting avoids a
+scientific-notation `+` being interpreted as a button separator.
+
+On each new guest input frame, native code computes X/Z distance `d` and
+`strength * clamp((d-stop)/(slow-stop), 0, 1)`, points toward the target, and uses
+the current world-camera projection. Feedback preserves that computed controller
+magnitude even with a skewed camera basis. An unchanged held segment updates only
+axes, without repeating button/touch edges. Inside the stop radius it is neutral.
+Health/death and horizon checks retain precedence.
+
+This is horizontal steering, not pathfinding, a ground-contact test, or a native
+success flag. The evaluator still requires stable **3D** arrival. Vertical mismatch,
+obstacles, deadzones and low-strength/large-slow-radius mutants can prevent arrival
+and receive ordinary failure fitness. For illustration, a hypothetical 0.2 stick
+deadzone with the default strength/slow/stop values stalls near radius 0.23; that
+is a synthetic model, not a measured Ocarina deadzone. Qualify movement and quiet
+terrain height in the actual game before adopting a new objective.
+
+Frame-counted button and segment-transition timing remains sensitive to game time
+per presented frame. Target steering corrects endpoint motion while a goal is
+held; it does not normalize jump timing or rewind the world. A new policy uses a
+fresh database and fresh fitness evaluations; a 768-gene stick chromosome cannot
+be silently reinterpreted as a 1,024-gene goal chromosome. `--initial-sigma` controls
+initial population spread independently of later `--mutation-sigma`; its default
+remains 0.35, while a narrowly seeded feedback qualification can use 0.04.
+
 ### Native replay protocol
 
 Start the host with a fresh `DM_CTL` path. `DM_CTL_POLL_US=1000` reduces its command
@@ -257,7 +323,7 @@ poll interval from the default 100,000 microseconds; accepted values are integra
 1,000–1,000,000. The native input loop does not wait for Python observations.
 
 ```text
-replay /absolute/timeline /absolute/ack [health=hex-address:decimal-u32-threshold] [world_xz=rotation-address:guard1-address:guard1-value:guard2-address:guard2-value]
+replay /absolute/timeline /absolute/ack [health=hex-address:decimal-u32-threshold] [world_xz=rotation-address:guard1-address:guard1-value:guard2-address:guard2-value] [position_xyz=position-address:guard1-address:guard1-value:guard2-address:guard2-value]
 replay_status /absolute/ack
 replay_cancel /absolute/ack
 replay_observe /absolute/read-request /absolute/ack
@@ -284,7 +350,19 @@ ACKs report `ok`, `error`, `epoch`, `current_frame`, `start_frame`, exclusive
 World-direction support adds `left_stick_space` (`camera` or `world_xz`),
 `world_xz` (null or the five canonical hexadecimal binding fields above), and
 `last_camera_frame` (zero before the first transform or in camera-relative mode).
-All five `world_xz` command fields are hexadecimal; either option may appear first.
+Position feedback adds `movement_mode` (`timeline` or `target_feedback`),
+`position_xyz` (null or canonical five-field binding), `last_position_frame`, and
+`last_position` (null before its first read, otherwise XYZ). The adapter requires
+an exact feedback mode/binding ACK and cancels uncertain owned input before runner
+cleanup. Old hosts remain compatible with ordinary timelines; they cannot
+silently accept feedback. UI recovery omits both world and position bindings.
+
+All five fields of each binding option are hexadecimal; optional arguments can
+appear in any order. A `G` token requires both bindings, conflicts with every
+left-stick token in that segment, and may coexist with buttons/right-stick input.
+A position binding without any `G` segment is rejected. Native `G` fields require
+finite target coordinates with absolute value below 1,000,000, strength in 0–1,
+and `0 <= stop < slow <= 1000`. Invalid replacements preserve the old replay.
 The observer accepts lines `hex-address decimal-byte-count`, at most 128 ranges,
 4 KiB each and 64 KiB total. Each result has address, size, hexadecimal bytes or
 an explicit error; failed reads never become zero-filled observations. The

@@ -334,6 +334,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** native replay tests exercise yaw/pitch, per-frame changes inside a hold, invalid bindings, terminal precedence and physical input. The Python adapter verifies the exact ACK and excludes the option from UI recovery. Camera actor identity does not prove active-camera selection in a cutscene; full-matrix reads are not atomic scene snapshots.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), where four pairs of the same genome began within 0.032 world units but separated by 1.33–13.63 units after about 120 frames. Their starting camera yaw differed by 10.38–157.17 degrees; continuously evolving hazards remain another source of variation.
 
+### Timed movement overshoots when presented frames slow down
+
+- **Symptom:** an identical fixed-frame movement chromosome travels too far when rendering falls from roughly 60 to 30 presented frames per second.
+- **Cause:** replay counts presented frames while the game can advance more simulation time per presentation. Camera normalization does not correct a held movement's physical duration or stop at its objective.
+- **Fix:** optional guarded `position_xyz` replay and `G` goal tokens compute horizontal steering and distance-based braking in the native input loop each new frame. The existing camera transform supplies direction; feedback preserves the requested controller magnitude. A versioned many-gene policy evolves target offsets, strength, slowdown, buttons and holds. Legacy input, death/epoch precedence and 3D objective scoring remain unchanged. See [target-feedback genes](../evolution.md#native-target-feedback-genes).
+- **Check:** native tests cover guarded position reads, token conflicts, invalid replacement, camera skew, same-frame caching, terminal precedence and concurrent replacement. Synthetic 30/60 Hz plants, including a hypothetical deadzone, test braking; they do not establish live terrain/deadzone behavior. Jump and waypoint-transition timing still use presented frames.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), while returning from the sword checkpoint toward the village.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

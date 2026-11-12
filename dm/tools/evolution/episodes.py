@@ -8,7 +8,16 @@ from .timeline import EpisodeScore,compile_timeline,gene_space
 
 
 def validate_episode(spec):
-    gene_space(spec.get('segments',128))
+    policy=spec.get('policy','timeline_v1')
+    gene_space(spec.get('segments',128),policy)
+    if policy=='target_feedback_v1':
+        radius=spec.get('feedback_stop_radius',.1)
+        if type(radius) not in (int,float) or not math.isfinite(radius) or not 0<=radius<=.2 or radius>=spec.get('tolerance',.5):
+            raise ValueError('Feedback stop radius must be within 0..0.2 and below objective tolerance')
+        target=spec['target']
+        if not isinstance(target,(list,tuple)) or len(target)!=3 or any(type(v) not in (int,float) or not math.isfinite(v) or abs(v)>=1e6 for v in target):
+            raise ValueError('Feedback needs a finite bounded XYZ target')
+    elif 'feedback_stop_radius' in spec:raise ValueError('Feedback radius requires target_feedback_v1 policy')
     EpisodeScore(spec['start'],spec['target'],spec['horizon_frames'],spec.get('tolerance',.5))
     if spec['horizon_frames']>1000000:raise ValueError('Episode horizon too large')
     for name,default,lo,hi in [('poll_seconds',.05,.005,.5),('start_tolerance',.3,.01,2.),('stall_seconds',30.,1.,120.)]:
@@ -28,6 +37,9 @@ class NativeEpisodes:
     def __init__(self,bridge,spec,log,reset_backend=None):
         validate_episode(spec)
         self.bridge=bridge;self.spec=spec;self.log=log;self.reset_backend=reset_backend
+        self.feedback=spec.get('policy','timeline_v1')=='target_feedback_v1'
+        if self.feedback and (getattr(bridge,'world_xz',None) is None or getattr(bridge,'position_xyz',None) is None):
+            raise ValueError('Target feedback requires guarded position and world-camera bindings')
         # The UI mirror can lag the authoritative health store used by a native
         # lethal-damage callback. Keep scoring telemetry and guard binding separate.
         address=bridge.config.get('native_guard_health_address',bridge.config['reads']['health']['address'])
@@ -57,8 +69,17 @@ class NativeEpisodes:
             raise TrialStopped('Native episode is outside its verified start')
         scorer=EpisodeScore(initial['position'],s['target'],s['horizon_frames'],s.get('tolerance',.5))
         scorer.observe(0,initial['position'],initial['health'])
-        compiled=time.perf_counter();timeline=compile_timeline(genome,s.get('segments',128),s['horizon_frames']);compile_seconds=time.perf_counter()-compiled
-        started=time.perf_counter();status=b.start_replay(timeline,self.health_address)
+        compiled=time.perf_counter();timeline=compile_timeline(genome,s.get('segments',128),s['horizon_frames'],
+            policy=s.get('policy','timeline_v1'),target=s['target'],stop_radius=s.get('feedback_stop_radius',.1));compile_seconds=time.perf_counter()-compiled
+        started=time.perf_counter()
+        try:status=b.start_replay(timeline,self.health_address,**({'target_feedback':True} if self.feedback else {}))
+        except BaseException as error:
+            # A missing/mismatched mode ACK can follow successful native dispatch.
+            # Release owned input before the runner enters instrumentation cleanup.
+            if getattr(b,'owns_replay',False):
+                try:b.cancel_replay()
+                except BaseException as cancel_error:error.add_note('Native start cancellation also failed: '+str(cancel_error))
+            raise
         start_frame=status['start_frame'];end_frame=status['end_frame'];epoch=status['epoch']
         last_frame=start_frame;last_progress=started;max_skew=0;next_log=0;pending=None;interruption=None
         try:

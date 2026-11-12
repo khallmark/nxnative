@@ -93,7 +93,7 @@ class ReplayTests(unittest.TestCase):
     def test_menu_hold_uses_guest_frames_without_a_death_guard(self):
         with tempfile.TemporaryDirectory() as td:
             b=self.bridge(td);starts=[]
-            def start(timeline,health_address=None,threshold=0,episode=True):
+            def start(timeline,health_address=None,threshold=0,episode=True,target_feedback=False):
                 starts.append((timeline,dict(episode=episode)))
             b.start_replay=start
             b.wait_replay=lambda timeout=10:dict(reason='completed')

@@ -8,16 +8,25 @@ from typing import Any
 
 FIELDS={'lx':(-1.,1.),'ly':(-1.,1.),'dash':(-1.,1.),'jump':(-1.,1.),
         'attack':(-1.,1.),'frames':(1.,30.)}
+FEEDBACK_FIELDS={'target_dx':(-8.,8.),'target_dz':(-8.,8.),'strength':(0.,1.),
+                 'slow_radius':(.25,2.),'dash':(-1.,1.),'jump':(-1.,1.),
+                 'attack':(-1.,1.),'frames':(1.,30.)}
+POLICIES={'timeline_v1':FIELDS,'target_feedback_v1':FEEDBACK_FIELDS}
 
 
-def gene_space(segments=128):
+def gene_space(segments=128,policy="timeline_v1"):
     if type(segments) is not int or not 1<=segments<=2048:
         raise ValueError('Timeline needs 1..2048 action segments')
-    return {f'{i:04d}.{name}':limits for i in range(segments) for name,limits in FIELDS.items()}
+    if not isinstance(policy,str) or policy not in POLICIES:raise ValueError('Unknown native policy')
+    return {f'{i:04d}.{name}':limits for i in range(segments) for name,limits in POLICIES[policy].items()}
 
 
-def seed_genome(segments=128,direction=(0.,1.)):
-    space=gene_space(segments)
+def seed_genome(segments=128,direction=(0.,1.),policy="timeline_v1"):
+    space=gene_space(segments,policy)
+    if policy=="target_feedback_v1":
+        values=dict(target_dx=0.,target_dz=0.,strength=1.,slow_radius=.75,
+                    dash=-1.,jump=-1.,attack=-1.,frames=30.)
+        return {name:values[name.split('.')[1]] for name in space}
     if len(direction)!=2 or not all(math.isfinite(x) for x in direction):
         raise ValueError('Invalid initial stick direction')
     length=max(1.,math.hypot(*direction));x,y=(v/length for v in direction)
@@ -25,17 +34,33 @@ def seed_genome(segments=128,direction=(0.,1.)):
     return {name:values[name.split('.')[1]] for name in space}
 
 
-def compile_timeline(genome,segments=128,horizon_frames=3600):
+def compile_timeline(genome,segments=128,horizon_frames=3600,*,policy="timeline_v1",target=None,stop_radius=.1):
     """Repeat the chromosome to a fixed horizon; consecutive holds have no gaps."""
-    space=gene_space(segments)
+    space=gene_space(segments,policy)
+    if policy=="target_feedback_v1":
+        if not isinstance(target,(list,tuple)) or len(target)!=3 or any(type(v) not in (int,float) or not math.isfinite(v) or abs(v)>=1e6 for v in target):
+            raise ValueError("Feedback needs a finite bounded XYZ target")
+        if type(stop_radius) not in (int,float) or not math.isfinite(stop_radius) or not 0<=stop_radius<=.2:
+            raise ValueError("Feedback stop radius must be within 0..0.2")
     if set(genome)!=set(space) or any(type(genome[k]) not in (int,float) or not math.isfinite(genome[k]) or not lo<=genome[k]<=hi for k,(lo,hi) in space.items()):
         raise ValueError('Invalid timeline genes')
     if type(horizon_frames) is not int or not 1<=horizon_frames<=1000000:
         raise ValueError('Invalid episode frame horizon')
     frame=0;index=0;lines=[]
     while frame<horizon_frames:
-        prefix=f'{index%segments:04d}.';x=genome[prefix+'lx'];y=genome[prefix+'ly']
-        norm=max(1.,math.hypot(x,y));keys=[f'L{x/norm:.4f}/{y/norm:.4f}']
+        prefix=f'{index%segments:04d}.'
+        if policy=='target_feedback_v1':
+            assert target is not None
+            point=(target[0]+genome[prefix+'target_dx'],target[1],target[2]+genome[prefix+'target_dz'])
+            if any(abs(v)>=1e6 for v in point):raise ValueError('Feedback offset leaves bounded XYZ range')
+            # Fixed decimals cannot introduce an exponent '+' into button-token syntax.
+            values=(*point,genome[prefix+'strength'],stop_radius,genome[prefix+'slow_radius'])
+            encoded=[f'{v:.9f}' for v in values]
+            if any(abs(float(v))>=1e6 for v in encoded[:3]):raise ValueError('Encoded feedback target exceeds range')
+            keys=['G'+'/'.join(encoded)]
+        else:
+            x=genome[prefix+'lx'];y=genome[prefix+'ly']
+            norm=max(1.,math.hypot(x,y));keys=[f'L{x/norm:.4f}/{y/norm:.4f}']
         keys += [button for name,button in [('dash','A'),('jump','X'),('attack','Y')] if genome[prefix+name]>0]
         hold=min(horizon_frames-frame,max(1,round(genome[prefix+'frames'])))
         lines.append(f'f{frame}:'+ '+'.join(keys)+f'~f{hold}')

@@ -6,12 +6,18 @@
 // after the real matrix read, without racing a writer against the test thread.
 static uint64_t camera_test_matrix_address, *camera_test_changed_guard;
 static unsigned camera_test_matrix_reads;
+static uint64_t position_test_address, *position_test_changed_guard;
+static unsigned position_test_reads;
 static kern_return_t camera_test_read(vm_map_read_t task, mach_vm_address_t address, mach_vm_size_t size,
                                      mach_vm_address_t output, mach_vm_size_t *got) {
     kern_return_t result = mach_vm_read_overwrite(task, address, size, output, got);
     if (camera_test_matrix_address && address == camera_test_matrix_address) {
         ++camera_test_matrix_reads;
         if (camera_test_changed_guard) { *camera_test_changed_guard ^= 1; camera_test_changed_guard = NULL; }
+    }
+    if (position_test_address && address == position_test_address) {
+        ++position_test_reads;
+        if (position_test_changed_guard) { *position_test_changed_guard ^= 1; position_test_changed_guard = NULL; }
     }
     return result;
 }
@@ -37,7 +43,7 @@ static void test_invalid(const char *spec, const char *why) {
 static int test_install(const char *spec, uint64_t address, uint32_t threshold) {
     size_t n = 0; const char *error = NULL; replay_step *steps = test_parse(spec, &n, &error);
     if (!steps) { CHECK(0, "test timeline parses"); return 0; }
-    error = replay_install(steps, n, address, threshold, NULL);
+    error = replay_install(steps, n, address, threshold, NULL, NULL);
     if (error) { free(steps); CHECK(0, error); return 0; } return 1;
 }
 static uint64_t test_input(uint64_t frame) {
@@ -120,10 +126,10 @@ static void t_replay_frames(void) {
     replay_test_stop(); CHECK(!touch_down, "cancel lifts touch");
     size_t n; const char *error = NULL; replay_step *steps = test_parse("f0:A~f1", &n, &error);
     test_frame = UINT64_MAX - 1;
-    CHECK(!strcmp(replay_install(steps, n, 0, 0, NULL), "frame_overflow"), "absolute rebase overflow rejected"); free(steps);
+    CHECK(!strcmp(replay_install(steps, n, 0, 0, NULL, NULL), "frame_overflow"), "absolute rebase overflow rejected"); free(steps);
     test_frame = 500; atomic_store(&g_legacy_keys_on, 1);
     steps = test_parse("f0:A~f1", &n, &error); epoch = g_replay.epoch;
-    CHECK(!strcmp(replay_install(steps, n, 0, 0, NULL), "legacy_seconds_active") && g_replay.epoch == epoch, "legacy seconds playback excludes replacement");
+    CHECK(!strcmp(replay_install(steps, n, 0, 0, NULL, NULL), "legacy_seconds_active") && g_replay.epoch == epoch, "legacy seconds playback excludes replacement");
     free(steps); atomic_store(&g_legacy_keys_on, 0);
     atomic_store(&g_sync_on, 1); g_sync_held = 1; test_install("f0:X~f1", 0, 0);
     CHECK(!atomic_load(&g_sync_on) && !g_sync_held, "legacy frame replay is atomically replaced"); replay_test_stop();
@@ -145,7 +151,7 @@ static void camera_test_yaw(camera_fixture *fixture, float cosine, float sine) {
 static int test_install_world(const char *spec, const replay_camera *camera, uint64_t health) {
     size_t n = 0; const char *error = NULL; replay_step *steps = test_parse(spec, &n, &error);
     if (!steps) { CHECK(0, "world timeline parses"); return 0; }
-    error = replay_install(steps, n, health, 0, camera);
+    error = replay_install(steps, n, health, 0, camera, NULL);
     if (error) { free(steps); CHECK(0, error); return 0; }
     return 1;
 }
@@ -261,7 +267,7 @@ static void t_replay_world_failures(void) {
     replay_test_stop(); test_frame = 1100; test_install("f0:A~f20", 0, 0); test_input(1101);
     uint64_t epoch = g_replay.epoch; size_t n; const char *error = NULL;
     replay_step *steps = test_parse("f0:X~f4", &n, &error); fixture.tag ^= 1;
-    error = replay_install(steps, n, 0, 0, &camera);
+    error = replay_install(steps, n, 0, 0, &camera, NULL);
     CHECK(error && !strcmp(error, "camera_identity_error") && g_replay.epoch == epoch &&
           atomic_load(&g_sc_btn) == DM_BTN_A && steps[0].at == 0, "invalid world installation preserves current replay and unre-based input"); free(steps);
     camera_test_init(&fixture); test_install_world("f0:A+L1/0~f20", &camera, 0); test_input(1102);
@@ -495,6 +501,186 @@ static void t_replay_world_protocol(void) {
           "default ACK explicitly reports camera-relative mode"); free(json);
     replay_test_stop(); unlink(timeline); unlink(ack);
 }
+
+typedef struct { uint64_t self, tag; float xyz[3]; } position_fixture;
+static replay_position position_test_init(position_fixture *fixture) {
+    memset(fixture, 0, sizeof *fixture); fixture->self = (uint64_t)(uintptr_t)fixture; fixture->tag = 0xabcdef;
+    return (replay_position){(uint64_t)(uintptr_t)fixture->xyz,
+        (uint64_t)(uintptr_t)&fixture->self, fixture->self, (uint64_t)(uintptr_t)&fixture->tag, fixture->tag};
+}
+static int test_install_target(const char *spec, const replay_camera *camera, const replay_position *position, uint64_t health) {
+    size_t count; const char *error = NULL; replay_step *steps = test_parse(spec, &count, &error);
+    if (!steps) { CHECK(0, "target timeline parses"); return 0; }
+    error = replay_install(steps, count, health, 0, camera, position);
+    if (error) { free(steps); CHECK(0, error); return 0; } return 1;
+}
+static void t_replay_target_parse(void) {
+    const char *bad[] = {"G", "G1/2/3/1/.1", "G1/2/3/1/.1/1/2", "Gnan/2/3/1/.1/1",
+        "G1/inf/3/1/.1/1", "G1/2/-inf/1/.1/1", "G1/2/3/nan/.1/1", "G1/2/3/1/nan/1",
+        "G1/2/3/1/.1/nan", "G1/2/3/1.01/.1/1", "G1/2/3/-.01/.1/1", "G1/2/3/1/-.1/1",
+        "G1/2/3/1/1/1", "G1/2/3/1/2/1", "G1/2/3/1/.1/1001", "G1000000/2/3/1/.1/1",
+        "G1/-1000000/3/1/.1/1", "G1/2/1000000/1/.1/1", "G1/2/3/1/.1/1junk",
+        "G1/2/3/1/.1/1+G1/2/3/1/.1/1", "G1/2/3/1/.1/1+L0/0", "L0/0+G1/2/3/1/.1/1",
+        "G1/2/3/1/.1/1+LLeft", "LUp+G1/2/3/1/.1/1", "lright+G1/2/3/1/.1/1", "G1/2/3/1/.1/1+ldown"};
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) { char line[200]; snprintf(line, sizeof line, "f0:%s~f2", bad[i]); test_invalid(line, "key_syntax"); }
+    size_t count; const char *error = NULL;
+    replay_step *steps = test_parse("f0:G-3/17/4/.5/0/1000+L+R.2/.3+X~f5 f5:L1/0~f2", &count, &error);
+    CHECK(steps && count == 2 && steps[0].target.enabled && steps[0].target.xyz[1] == 17 && steps[0].target.strength == .5f && !steps[1].target.enabled,
+          "G accepts bounded fields, buttons including shoulder L, right stick and mixed legacy steps"); free(steps);
+    const char *badbindings[] = {"position_xyz=", "position_xyz=1000:2000:1:2008", "position_xyz=1000:2000:1:2008:2:3",
+        "position_xyz=0:2000:1:2008:2", "position_xyz=1001:2000:1:2008:2", "position_xyz=fffffffffffffff8:2000:1:2008:2",
+        "position_xyz=1000:0:1:2008:2", "position_xyz=1000:2001:1:2008:2", "position_xyz=1000:2000:1:0:2",
+        "position_xyz=1000:2000:1:2009:2", "position_xyz=1000:fffffffffffffff8:1:2008:2", "position_xyz=1000:2000:1:fffffffffffffff8:2",
+        "position_xyz=1000:2000:-1:2008:2", "position_xyz=1000:2000:10000000000000000:2008:2", "position_xyz=1000:2000:1:2008:2junk"};
+    for (size_t i = 0; i < sizeof badbindings / sizeof *badbindings; i++) {
+        char *copy = strdup(badbindings[i]); replay_position position = {0}; const char *failure = replay_position_parse(copy, &position);
+        CHECK(failure && !strcmp(failure, "position_syntax") && !position.position_address, badbindings[i]); free(copy);
+    }
+    char good[] = "position_xyz=0x1000:2000:0:0X2008:ffffffffffffffff"; replay_position position;
+    CHECK(!replay_position_parse(good, &position) && position.position_address == 0x1000 && !position.guard1_value && position.guard2_value == UINT64_MAX,
+          "position binding accepts exact hex values");
+}
+static void t_replay_target_math(void) {
+    replay_target target = {.enabled = 1, .xyz = {3, 50, 4}, .strength = .5f, .stop_radius = .1f, .slow_radius = 2.1f};
+    float position[3] = {0}; key_step input = {0};
+    CHECK(replay_target_axes(&target, position, &input) == .5f && abs(input.lx - 9830) <= 1 && abs(input.ly - 13107) <= 1,
+          "far target normalized to capped radial strength in XZ");
+    target.xyz[0] = 1.1f; target.xyz[2] = 0;
+    CHECK(fabsf(replay_target_axes(&target, position, &input) - .25f) < 1e-6f && abs(input.lx - 8192) <= 1 && !input.ly,
+          "slowdown is linear between stop and slow radii");
+    target.xyz[0] = .1f; replay_target_axes(&target, position, &input);
+    CHECK(!input.lx && !input.ly, "stop boundary produces neutral axes");
+    target.xyz[0] = 0; replay_target_axes(&target, position, &input);
+    CHECK(!input.lx && !input.ly && target.xyz[1] == 50, "zero horizontal error ignores height without claiming arrival");
+    target.xyz[0] = -3; target.xyz[2] = -4; replay_target_axes(&target, position, &input);
+    CHECK(input.lx < 0 && input.ly < 0, "feedback can correct past-target movement in negative quadrant");
+    target.strength = 0; replay_target_axes(&target, position, &input);
+    CHECK(!input.lx && !input.ly, "zero strength remains neutral");
+}
+static void t_replay_target_frames(void) {
+    replay_test_stop(); test_frame = 2000; camera_fixture cf; replay_camera camera = camera_test_init(&cf);
+    position_fixture pf; replay_position position = position_test_init(&pf);
+    CHECK(test_install_target("f0:G3/7/0/1/.1/1+R.25/-.5+A+T.2x.3~f8 f8:L0/1~f2", &camera, &position, 0), "install target feedback");
+    position_test_address = position.position_address; position_test_reads = 0;
+    CHECK(test_input(2001) == DM_BTN_A && atomic_load(&g_sc_axes) == pack(32767, 0, 8192, -16384), "feedback uses target direction with unchanged right stick/buttons");
+    unsigned reads = position_test_reads; int downs = touch_downs; pf.xyz[0] = 2.5f; camera_test_yaw(&cf, 0, 1);
+    test_input(2001);
+    CHECK(position_test_reads == reads && atomic_load(&g_sc_axes) == pack(32767, 0, 8192, -16384), "position and camera are cached within one frame");
+    dm_input_set(DM_BTN_B, 321, 123, 0, 0); dm_pad_set(DM_BTN_Y, -321, -123, 0, 0);
+    test_frame = 2002; keys_sync();
+    CHECK(atomic_load(&g_sc_axes) == pack(0, -14563, 8192, -16384) && g_replay.position_frame == 2002 && g_replay.last_position[0] == 2.5f,
+          "held target refresh brakes and follows camera on next frame");
+    CHECK(!atomic_load(&g_sc_latch) && !atomic_load(&g_sc_peek_latch) && touch_downs == downs && touch_down,
+          "feedback updates do not repeat button/touch edges");
+    CHECK(atomic_load(&g_btn) == DM_BTN_B && atomic_load(&g_axes) == pack(321, 123, 0, 0) && atomic_load(&g_pad_btn[0]) == DM_BTN_Y,
+          "feedback leaves physical keyboard and pad input untouched");
+    pf.xyz[0] = 3; test_input(2003);
+    CHECK(atomic_load(&g_sc_axes) == pack(0, 0, 8192, -16384) && atomic_load(&g_replay_on), "horizontal stop keeps buttons and does not end the attempt");
+    pf.xyz[0] = 2; reads = position_test_reads; test_input(2009);
+    CHECK(position_test_reads == reads && atomic_load(&g_sc_axes) == pack(-32767, 0, 0, 0), "mixed legacy step retains world direction without reading position");
+    pf.tag ^= 1; test_input(2011);
+    CHECK(!strcmp(g_replay.reason, "completed") && position_test_reads == reads, "horizon precedes invalid position read");
+    position_test_address = 0; position = position_test_init(&pf); camera = camera_test_init(&cf);
+    cf.rotation[2] = -.6f; cf.rotation[8] = .8f;
+    test_install_target("f0:G0/0/3/.4/.1/1~f3", &camera, &position, 0); test_input(2012);
+    uint64_t axes = atomic_load(&g_sc_axes); int32_t ax = (int16_t)axes, ay = (int16_t)(axes >> 16);
+    CHECK(fabsf(hypotf((float)ax, (float)ay) / 32767 - .4f) < .00005f, "skew camera cannot amplify feedback beyond requested controller strength");
+    replay_test_stop(); dm_input_set(0, 0, 0, 0, 0); dm_pad_set(0, 0, 0, 0, 0);
+    atomic_store(&g_latch, 0); atomic_store(&g_peek_latch, 0); atomic_store(&g_pad_latch[0], 0);
+}
+static void t_replay_target_failures(void) {
+    camera_fixture cf; replay_camera camera = camera_test_init(&cf); position_fixture pf; replay_position position = position_test_init(&pf);
+    replay_test_stop(); test_frame = 2100; test_install("f0:A~f100", 0, 0); test_input(2101); uint64_t epoch = g_replay.epoch;
+    for (int binding = 0; binding < 3; binding++) {
+        size_t n; const char *error = NULL; replay_step *steps = test_parse("f0:G1/2/3/1/.1/1~f3", &n, &error);
+        error = replay_install(steps, n, 0, 0, binding & 1 ? &camera : NULL, binding & 2 ? &position : NULL);
+        CHECK(error && !strcmp(error, "target_binding") && g_replay.epoch == epoch && atomic_load(&g_sc_btn) == DM_BTN_A && steps[0].at == 0,
+              "missing target binding preserves old input and epoch before rebase"); free(steps);
+    }
+    float xyz[3]; const float invalid[] = {NAN, INFINITY, -INFINITY, 1e6f, -1e6f};
+    for (int axis = 0; axis < 3; axis++) for (size_t i = 0; i < sizeof invalid / sizeof *invalid; i++) {
+        position_test_init(&pf); pf.xyz[axis] = invalid[i];
+        CHECK(!strcmp(replay_position_read(&position, xyz), "position_value_error"), "every player coordinate must be finite and bounded");
+    }
+    position_test_init(&pf); pf.tag ^= 1;
+    size_t n; const char *error = NULL; replay_step *steps = test_parse("f0:G1/2/3/1/.1/1~f3", &n, &error);
+    error = replay_install(steps, n, 0, 0, &camera, &position);
+    CHECK(error && !strcmp(error, "position_identity_error") && g_replay.epoch == epoch && atomic_load(&g_sc_btn) == DM_BTN_A,
+          "invalid position at install cannot replace active timeline"); free(steps);
+    position_test_init(&pf); position_test_address = position.position_address; position_test_changed_guard = &pf.self;
+    CHECK(!strcmp(replay_position_read(&position, xyz), "position_identity_error"), "position identity bracket catches changes during copy"); position_test_address = 0;
+    position_test_init(&pf); uint32_t health = 10;
+    test_install_target("f0:G1/2/3/1/.1/1+A~f30", &camera, &position, (uint64_t)(uintptr_t)&health); test_input(2102);
+    health = 0; pf.tag ^= 1;
+    CHECK(test_input(2103) == 0 && !strcmp(g_replay.reason, "death") && !atomic_load(&g_sc_axes), "death wins over simultaneous invalid player identity");
+    position_test_init(&pf); test_install_target("f0:G1/2/3/1/.1/1+A~f30", &camera, &position, 0); test_input(2104);
+    pf.xyz[1] = NAN;
+    CHECK(test_input(2105) == 0 && !strcmp(g_replay.reason, "position_value_error") && !atomic_load(&g_sc_axes) && !atomic_load(&g_sc_latch), "invalid active position releases buttons, axes and pending edges");
+    position_test_init(&pf); test_install_target("f0:G1/2/3/1/.1/1~f30", &camera, &position, 0); test_input(2106); pf.self ^= 1;
+    CHECK(test_input(2107) == 0 && !strcmp(g_replay.reason, "position_identity_error"), "changed active player identity stops feedback");
+    mach_vm_address_t page = 0;
+    CHECK(mach_vm_allocate(mach_task_self(), &page, 4096, VM_FLAGS_ANYWHERE) == KERN_SUCCESS, "allocate position mapping for unreadable regression");
+    if (page) {
+        position_test_init(&pf); memcpy((void *)(uintptr_t)page, pf.xyz, sizeof pf.xyz); position.position_address = page;
+        test_install_target("f0:G1/2/3/1/.1/1~f30", &camera, &position, 0); test_input(2108);
+        CHECK(mach_vm_deallocate(mach_task_self(), page, 4096) == KERN_SUCCESS, "unmap active position fixture");
+        CHECK(test_input(2109) == 0 && !strcmp(g_replay.reason, "position_read_error"), "unmapped player position fails safely through Mach reads");
+    }
+    replay_test_stop();
+}
+// Synthetic plant only: 2.5 world units/second at full stick, optional hard
+// dead zone. It is not a measurement of the game's movement/physics behavior.
+static float target_test_plant(int fps, float deadzone) {
+    camera_fixture cf; replay_camera camera = camera_test_init(&cf); position_fixture pf; replay_position position = position_test_init(&pf);
+    test_frame = 3000; test_install_target("f0:G3/9/0/1/.1/.75~f180", &camera, &position, 0);
+    for (unsigned i = 1; i <= 180; i++) {
+        test_input(3000 + i); uint64_t axes = atomic_load(&g_sc_axes); float x = (int16_t)axes / 32767.f;
+        if (fabsf(x) >= deadzone) pf.xyz[0] += x * 2.5f / fps;
+    }
+    test_input(3181); CHECK(!strcmp(g_replay.reason, "completed"), "plant uses unchanged horizon terminal, not arrival success");
+    return pf.xyz[0];
+}
+static void t_replay_target_plant(void) {
+    float a = target_test_plant(60, 0), b = target_test_plant(30, 0);
+    CHECK(fabsf(a - b) < .02f && a > 2.85f && a <= 3 && b > 2.85f && b <= 3,
+          "30/60Hz synthetic plant brakes at comparable endpoints without overshoot");
+    float c = target_test_plant(60, .2f), d = target_test_plant(30, .2f);
+    CHECK(fabsf(c - d) < .04f && c > 2.5f && c <= 3 && d > 2.5f && d <= 3,
+          "default braking reaches .5 tolerance in synthetic .2 dead-zone plant at both rates");
+    printf("target plant endpoints: 60Hz %.6f, 30Hz %.6f; synthetic .2 deadzone %.6f / %.6f (target 3)\n", a, b, c, d);
+}
+static void t_replay_target_protocol(void) {
+    char timeline[PATH_MAX], ack[PATH_MAX], command[PATH_MAX * 3], world[256], binding[256], expected[100];
+    snprintf(timeline, sizeof timeline, "%s/target.keys", replay_test_dir); snprintf(ack, sizeof ack, "%s/target.json", replay_test_dir);
+    camera_fixture cf; replay_camera camera = camera_test_init(&cf); position_fixture pf; replay_position position = position_test_init(&pf); uint32_t health = 10;
+    snprintf(world, sizeof world, "world_xz=%llx:%llx:%llx:%llx:%llx", (unsigned long long)camera.rotation_address,
+        (unsigned long long)camera.guard1_address, (unsigned long long)camera.guard1_value, (unsigned long long)camera.guard2_address, (unsigned long long)camera.guard2_value);
+    snprintf(binding, sizeof binding, "position_xyz=%llx:%llx:%llx:%llx:%llx", (unsigned long long)position.position_address,
+        (unsigned long long)position.guard1_address, (unsigned long long)position.guard1_value, (unsigned long long)position.guard2_address, (unsigned long long)position.guard2_value);
+    test_write(timeline, "f0:G3/7/0/1/.1/.75~f10"); test_frame = 4000;
+    snprintf(command, sizeof command, "replay %s %s %s %s health=%llx:0", timeline, ack, binding, world, (unsigned long long)(uintptr_t)&health);
+    char *json = test_command(command, ack); snprintf(expected, sizeof expected, "\"position_address\":\"0x%llx\"", (unsigned long long)position.position_address);
+    CHECK(json && strstr(json, "\"ok\":true") && strstr(json, "\"movement_mode\":\"target_feedback\"") && strstr(json, expected) &&
+          strstr(json, "\"last_position_frame\":0") && strstr(json, "\"last_position\":null"), "ACK echoes feedback mode and binding before any frame snapshot"); free(json);
+    test_input(4001); snprintf(command, sizeof command, "replay_status %s", ack); json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"last_position_frame\":4001") && strstr(json, "\"last_position\":[0,0,0]"), "ACK reports exact last feedback observation frame and XYZ"); free(json);
+    uint64_t epoch = g_replay.epoch;
+    const char *extra[] = {binding, "unknown=value", "health=4:0 health=8:0", "world_xz=1:2:3:4:5 extra another"};
+    for (size_t i = 0; i < sizeof extra / sizeof *extra; i++) {
+        snprintf(command, sizeof command, "replay %s %s %s %s %s", timeline, ack, world, binding, extra[i]); json = test_command(command, ack);
+        CHECK(json && strstr(json, "\"error\":\"command_syntax\"") && g_replay.epoch == epoch, "extra or duplicate third/fourth options are never truncated and accepted"); free(json);
+    }
+    snprintf(command, sizeof command, "replay %s %s %s position_xyz=1:2:3:4:5", timeline, ack, world); json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"error\":\"position_syntax\"") && g_replay.epoch == epoch, "malformed position binding preserves active replay"); free(json);
+    snprintf(command, sizeof command, "replay %s %s %s", timeline, ack, world); json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"error\":\"target_binding\"") && g_replay.epoch == epoch, "G without position binding is rejected before replacement"); free(json);
+    test_write(timeline, "f0:L1/0~f5"); snprintf(command, sizeof command, "replay %s %s %s %s", timeline, ack, world, binding); json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"error\":\"position_unused\"") && g_replay.epoch == epoch, "unused position binding cannot silently masquerade as feedback"); free(json);
+    snprintf(command, sizeof command, "replay %s %s", timeline, ack); json = test_command(command, ack);
+    CHECK(json && strstr(json, "\"movement_mode\":\"timeline\"") && strstr(json, "\"position_xyz\":null") && strstr(json, "\"last_position\":null"), "legacy ACK remains explicit with neutral feedback fields"); free(json);
+    replay_test_stop(); unlink(timeline); unlink(ack);
+}
+
 static _Atomic int replay_stress_stop;
 static void *replay_reader_thread(void *arg) {
     (void)arg;
@@ -504,11 +690,12 @@ static void *replay_reader_thread(void *arg) {
 static void t_replay_threads(void) {
     replay_test_stop(); test_frame = 10000; atomic_store(&replay_stress_stop, 0);
     camera_fixture fixture; replay_camera camera = camera_test_init(&fixture);
+    position_fixture pf; replay_position position = position_test_init(&pf);
     pthread_t reader; int started = !pthread_create(&reader, NULL, replay_reader_thread, NULL);
     CHECK(started, "concurrent native HID reader starts"); if (!started) return;
     for (int i = 0; i < 1000; i++) {
-        size_t n; const char *error = NULL; replay_step *steps = test_parse("f0:A~f2 f2:X~f2", &n, &error);
-        if (!steps || (error = replay_install(steps, n, 0, 0, i & 1 ? &camera : NULL))) { free(steps); CHECK(0, "concurrent replay replacement"); break; }
+        size_t n; const char *error = NULL; replay_step *steps = test_parse(i % 3 == 2 ? "f0:G1/0/0/1/.1/1+A~f2 f2:G0/0/1/.5/.1/1+X~f2" : "f0:A~f2 f2:X~f2", &n, &error);
+        if (!steps || (error = replay_install(steps, n, 0, 0, i % 3 ? &camera : NULL, i % 3 == 2 ? &position : NULL))) { free(steps); CHECK(0, "concurrent replay replacement"); break; }
         // Make the first step due without racing the fixture's non-atomic clock.
         pthread_mutex_lock(&g_sync_mu); --g_replay.start; --g_replay.steps[0].at; pthread_mutex_unlock(&g_sync_mu);
         if (i & 1) replay_test_stop();
@@ -530,6 +717,7 @@ static void t_replay_large(void) {
 int main(void) {
     int baseline = hid_baseline_main();
     strcpy(replay_test_dir, "/tmp/nxnative-replay-test-XXXXXX"); CHECK(mkdtemp(replay_test_dir) != NULL, "temporary protocol directory");
+    t_replay_target_parse(); t_replay_target_math(); t_replay_target_frames(); t_replay_target_failures(); t_replay_target_plant(); t_replay_target_protocol();
     t_replay_parse(); t_replay_frames(); t_replay_world_parse(); t_replay_world_math(); t_replay_world_frames(); t_replay_world_failures(); t_replay_health(); t_replay_terminal(); t_replay_terminal_restore(); t_replay_protocol(); t_replay_world_protocol(); t_replay_threads(); t_replay_large();
     replay_test_stop(); free(g_replay.steps); g_replay.steps = NULL;
     CHECK(!rmdir(replay_test_dir), "remove protocol directory without leftovers");
