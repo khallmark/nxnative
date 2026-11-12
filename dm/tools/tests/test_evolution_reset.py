@@ -498,7 +498,8 @@ static void *slots[4];
 static guint64 current_frame;
 static int warp_count, race_mirror, change_tls;
 static int readonly_health;
-static int action_count, action_failure, action_bad_selection, action_bad_tls, action_cancel;
+static int action_count, action_failure, action_bad_selection, action_bad_tls, action_cancel, warp_cancel;
+static gpointer expected_warp_x18;
 guint32 task_self_port=123;
 gint region_info(guint32 task, guint64 *address, guint64 *size,
                  gint flavor, gint *info, guint32 *count, guint32 *object) {
@@ -553,13 +554,17 @@ void warp_guest(gpointer actor, const float *matrix, guint32 flags) {
   guint i;
   assert(actor==player_data && flags==0);
   assert(packet.diagnostic_phase==5 && packet.warp_called && !packet.warp_returned);
-  if(packet.action_enabled) assert(action_count==1 && packet.action_context_restored && slots[g_key18]==(void *)0xabcd);
+  if(packet.action_enabled) {
+    assert(action_count==1 && packet.action_context_restored && slots[g_key18]==expected_warp_x18);
+    assert(current_frame>packet.action_frame && packet.state==6);
+  }
   ++warp_count;
   for(i=0;i!=3;++i) ((float *)(player_data+0x31c))[i]=matrix[i*4+3];
   for(i=0;i!=9;++i) ((float *)(player_data+0x328))[i]=matrix[(i/3)*4+i%3];
   slots[g_key18]=(void *)0xbeef;
   if(race_mirror) *(guint32 *)(life_data+0x1ca8)=3;
   if(change_tls) slots[g_keytls]=(void *)0xbad;
+  if(warp_cancel) { cancel_pending(); assert(packet.state==6); }
 }
 static void initialize(void) {
   memset(&packet,0,sizeof(packet)); memset(player_data,0,sizeof(player_data));
@@ -600,19 +605,28 @@ static void initialize(void) {
   slots[2]=(void *)0x111; slots[3]=(void *)0x222;
   dm_gate_top[0]=0x100000000ULL;
   current_frame=100; warp_count=race_mirror=change_tls=readonly_health=0;
-  action_count=action_failure=action_bad_selection=action_bad_tls=action_cancel=0;
+  action_count=action_failure=action_bad_selection=action_bad_tls=action_cancel=warp_cancel=0;
+  expected_warp_x18=(void *)0xabcd;
+}
+static void main_tick(void) {
+  GumCpuContext cpu; GumInvocationContext ic;
+  cpu.sp=(guint64)(gsize)&cpu & ~15ULL;
+  ic.function=(void *)0x778899; ic.cpu_context=&cpu; ic.claimed=0;
+  on_enter(&ic); on_leave(&ic);
 }
 static void tick(void) {
   GumCpuContext cpu; GumInvocationContext ic;
   cpu.sp=(guint64)(gsize)&cpu & ~15ULL;
   ic.function=(void *)0x778899; ic.cpu_context=&cpu; ic.claimed=0;
-  if(packet.action_enabled && packet.mode==2 && packet.state==1) {
-    // Main must not run the action before the actor's normal slot-clear phase.
-    on_enter(&ic); assert(!ic.claimed && packet.state==1);
+  if(packet.action_enabled && packet.mode==2 && (packet.state==1 || packet.state==7)) {
+    if(packet.state==1) {
+      // Main cannot run Wait before the actor's normal slot-clear phase.
+      on_enter(&ic); assert(!ic.claimed && packet.state==1);
+    }
     cpu.x[20]=packet.player; cpu.x[24]=packet.action_bsa;
     on_action_enter(&ic);
   }
-  on_enter(&ic); on_leave(&ic);
+  main_tick();
 }
 int main(void) {
   initialize(); packet.mode=0; tick();
@@ -695,7 +709,13 @@ int main(void) {
   assert(action_count==1 && packet.action_called && packet.action_returned && packet.action_result==0);
   assert(packet.action_context_restored && packet.action_selected==40 && packet.action_requested==40);
   assert(packet.action_tid==321 && packet.action_frame==100 && packet.action_stack_delta<65536);
-  assert(warp_count==1 && !packet.error && hp_data[1]==10);
+  assert(packet.state==7 && warp_count==0 && !packet.error && hp_data[1]==4);
+  assert(packet.diagnostic_phase==20 && packet.readback_count==0);
+  tick(); main_tick();
+  assert(packet.state==7 && action_count==1 && warp_count==0 && packet.action_frame==100);
+  ++current_frame; tick();
+  assert(packet.state==5 && packet.warp_frame==101 && packet.action_frame==100);
+  assert(warp_count==1 && hp_data[1]==10 && packet.stable_count==1);
   ++current_frame; tick(); ++current_frame; tick();
   assert(packet.state==3 && action_count==1 && warp_count==1);
   initialize(); packet.action_enabled=1; {
@@ -716,6 +736,68 @@ int main(void) {
   assert(packet.state==4 && !warp_count && hp_data[1]==4 && slots[0]==(void *)0xabcd);
   initialize(); packet.action_enabled=1; action_bad_tls=1; tick();
   assert(packet.error==17 && !warp_count && hp_data[1]==4 && slots[0]==(void *)0xabcd);
+  // Cancelling the pending interval never invokes warp or heals.
+  initialize(); packet.action_enabled=1; tick(); cancel_pending();
+  assert(packet.state==4 && action_count==1 && !warp_count && hp_data[1]==4);
+  ++current_frame; tick(); assert(packet.state==4 && !warp_count);
+  // A missing actor callback has a separate 60-guest-frame Main watchdog.
+  initialize(); packet.action_enabled=1; tick();
+  current_frame=159; main_tick(); assert(packet.state==7 && !packet.error);
+  current_frame=160; main_tick();
+  assert(packet.state==3 && packet.error==19 && !warp_count && hp_data[1]==4);
+  tick(); assert(action_count==1 && !warp_count);
+  // The actor path applies the same deadline before any delayed warp.
+  initialize(); packet.action_enabled=1; tick(); current_frame=160; tick();
+  assert(packet.error==19 && packet.state==3 && !warp_count);
+  // Every later callback repeats identity, permission and selection guards.
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  *(guint64 *)(bsa_data+0x18)=0; tick(); assert(packet.error==14 && !warp_count);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  *(guint64 *)(life_data+0x18)=0; tick(); assert(packet.error==8 && !warp_count);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  readonly_health=1; tick(); assert(packet.error==12 && !warp_count && hp_data[1]==4);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  *(guint32 *)(action_data+0x28)=41; tick(); assert(packet.error==18 && !warp_count);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  action_data[0x7c]=2; tick(); assert(packet.error==15 && !warp_count);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  slots[g_keygate]=(void *)1; tick(); assert(packet.error==1 && !warp_count);
+  // The later actor callback owns a fresh TSD context; never restore frameN's.
+  initialize(); packet.action_enabled=1; tick(); ++current_frame;
+  expected_warp_x18=slots[g_key18]=(void *)0x777;
+  slots[g_keytls]=(void *)0x333; slots[g_keytlr]=(void *)0x444; tick();
+  assert(warp_count==1 && !packet.error && slots[g_key18]==(void *)0x777);
+  assert(packet.action_tls_after==0x111 && packet.action_tlr_after==0x222);
+  assert(packet.action_frame==100 && packet.warp_frame==101);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame; change_tls=1; tick();
+  assert(packet.error==7 && warp_count==1 && !packet.health_written);
+  initialize(); packet.action_enabled=1; tick(); ++current_frame; warp_cancel=1; tick();
+  assert(packet.state==4 && warp_count==1 && slots[g_key18]==(void *)0xabcd);
+  ++current_frame; tick(); assert(warp_count==1 && action_count==1);
+  // The post-warp budget starts at warp_frame, not the earlier Wait frame.
+  initialize(); packet.action_enabled=1; tick(); current_frame=101; tick();
+  ((float *)(player_data+0x31c))[0]=99;
+  current_frame=160; tick(); assert(packet.state==5 && !packet.error);
+  current_frame=161; tick(); assert(packet.error==13 && warp_count==1 && action_count==1);
+  // Inside the anchor radius is insufficient when motion persists.
+  initialize(); tick(); ++current_frame; ((float *)(player_data+0x31c))[0]=1.02f; tick();
+  assert(packet.stable_count==0 && !packet.last_readback_stable);
+  assert(packet.position_delta_squared>.005f*.005f);
+  ((float *)(player_data+0x31c))[0]=1.04f; tick();
+  assert(packet.previous_position[0]==1.02f); // duplicate frame cannot replace baseline
+  ++current_frame; ((float *)(player_data+0x31c))[0]=1.044f; tick();
+  assert(packet.stable_count==0 && !packet.last_readback_stable && !packet.error);
+  ++current_frame; tick(); ++current_frame; tick(); ++current_frame; tick();
+  assert(packet.state==3 && packet.stable_count==3 && warp_count==1);
+  initialize(); tick(); ++current_frame; ((float *)(player_data+0x328))[0]=.99f; tick();
+  assert(packet.stable_count==0 && packet.rotation_delta>.005f && !packet.error);
+  initialize(); tick(); ++current_frame; ((float *)(player_data+0x31c))[0]=1.004f;
+  ((float *)(player_data+0x328))[0]=.996f; tick(); assert(packet.stable_count==2);
+  ++current_frame; tick(); assert(packet.state==3 && packet.stable_count==3);
+  initialize(); tick(); current_frame+=2; tick();
+  assert(packet.stable_count==0 && !packet.last_readback_stable);
+  ++current_frame; tick(); ++current_frame; tick(); ++current_frame; tick();
+  assert(packet.state==3 && packet.stable_count==3);
   puts("native checkpoint simulated-memory checks passed"); return 0;
 }
 '''
@@ -728,7 +810,7 @@ class NativeCheckpointTests(unittest.TestCase):
         script=Path(__file__).resolve().parents[2]/'games'/'0400486024DEC000'/'player_checkpoint.js'
         harness=r"""
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
-const bytes=Buffer.alloc(704);
+const bytes=Buffer.alloc(760);
 class Pointer {
   constructor(offset=0){this.offset=offset;}
   add(value){return new Pointer(this.offset+value);}
@@ -769,6 +851,36 @@ assert(bytes.equals(before));assert(JSON.stringify(observed).length<8192);
 bytes.writeInt32LE(3,0);bytes.writeUInt32LE(15,432);
 observed=context.rpc.exports.status();assert.equal(observed.state,3);assert(observed.active);
 assert.equal(observed.descriptor_restored,false); // A snapshot never calls finish/detach.
+bytes.writeInt32LE(7,0);bytes.writeUInt32LE(20,432);
+bytes.writeFloatLE(.000004,752);bytes.writeFloatLE(.003,756);
+observed=context.rpc.exports.status();
+assert.equal(observed.diagnostics.phase_name,'waiting_later_actor_update');
+assert.equal(observed.diagnostics.pre_warp_frame_budget,60);
+assert.equal(observed.diagnostics.motion_delta.limit,.005);
+assert(Math.abs(observed.diagnostics.motion_delta.position-.002)<1e-8);
+assert(Math.abs(observed.diagnostics.motion_delta.rotation_element-.003)<1e-8);
+assert(observed.diagnostics.snapshot_consistent && !observed.descriptor_restored);
+// Exercise real cancel/finish/detach logic; a busy actor cannot acknowledge early.
+let detached=0,flushed=0,sent=0;
+context.Interceptor.flush=()=>{++flushed;};context.send=()=>{++sent;};
+context.metrics=()=>({error_code:0,diagnostics:{}});
+context.setupRun=()=>({packet:new Pointer(),player:actor,expectedVtable:{},
+  mode:'player_checkpoint',nativePhase:'restore',inactive:false,nonce:'cancel-test',timer:null,
+  listener:{detach(){++detached;}},actionListener:{detach(){++detached;}},
+  readState:()=>bytes.readInt32LE(0),cancelPending:()=>{
+    bytes.writeInt32LE(1,348);
+    if([1,5,7].includes(bytes.readInt32LE(0)))bytes.writeInt32LE(4,0);
+    return bytes.readInt32LE(0);
+  }});
+vm.runInContext('active=setupRun()',context);bytes.writeInt32LE(6,0);
+let cancelled=context.rpc.exports.cancel();
+assert(!cancelled.descriptor_restored && cancelled.active && !detached && !flushed && !sent);
+bytes.writeInt32LE(4,0); // native callback restored context and returned from its claim
+cancelled=context.rpc.exports.cancel();
+assert(cancelled.descriptor_restored && !cancelled.active && detached===2 && flushed===1 && sent===1);
+vm.runInContext('active=setupRun()',context);bytes.writeInt32LE(7,0);
+cancelled=context.rpc.exports.cancel();
+assert(cancelled.descriptor_restored && !cancelled.active && detached===4 && flushed===2 && sent===2);
 """
         result=subprocess.run([node,'-e',harness,str(script)],capture_output=True,text=True,timeout=10)
         self.assertEqual(result.returncode,0,result.stderr)

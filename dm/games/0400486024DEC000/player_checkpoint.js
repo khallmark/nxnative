@@ -10,7 +10,7 @@ const WARP_OFFSET = 0xc6fb30;
 const ACTION_OFFSET = 0xc08f0;
 const ACTION_PHASE_OFFSET = 0xcba80;
 const PLAYER_VTABLE_OFFSET = 0x4b25e18;
-const PACKET_SIZE = 704;
+const PACKET_SIZE = 760;
 const OFF = {
   state: 0, mode: 4, expectedTid: 8, actualTid: 12, error: 16,
   restoreResult: 20, expectedInstance: 24, instance: 32, player: 40,
@@ -36,7 +36,8 @@ const OFF = {
   actionRequested: 616, actionSlotFlags: 620, actionReturned: 624, actionContextRestored: 628,
   actionX18After: 632, actionTlsAfter: 640, actionTlrAfter: 648,
   actionFrame: 656, actionGuestSp: 664, actionCallbackSp: 672, actionStackDelta: 680,
-  actionGateSlot: 688, actionTid: 696,
+  actionGateSlot: 688, actionTid: 696, previousPoseValid: 700,
+  previousPosition: 704, previousRotation: 716, positionDeltaSquared: 752, rotationDelta: 756,
 };
 
 const NATIVE_SOURCE = `
@@ -76,9 +77,11 @@ typedef struct {
   guint32 action_requested, action_slot_flags, action_returned, action_context_restored;
   guint64 action_x18_after, action_tls_after, action_tlr_after;
   guint64 action_frame, action_guest_sp, action_callback_sp, action_stack_delta, action_gate_slot;
-  guint32 action_tid, action_reserved;
+  guint32 action_tid, previous_pose_valid;
+  float previous_position[3], previous_rotation[9];
+  float position_delta_squared, rotation_delta;
 } BridgePacket;
-typedef char packet_size_check[sizeof(BridgePacket) == 704 ? 1 : -1];
+typedef char packet_size_check[sizeof(BridgePacket) == 760 ? 1 : -1];
 typedef char packet_matrix_check[offsetof(BridgePacket, matrix) == 144 ? 1 : -1];
 typedef char packet_tls_check[offsetof(BridgePacket, tls_before) == 216 ? 1 : -1];
 typedef char packet_life_check[offsetof(BridgePacket, life) == 256 ? 1 : -1];
@@ -89,6 +92,8 @@ typedef char packet_first_readback_check[offsetof(BridgePacket, first_readback_f
 typedef char packet_captured_check[offsetof(BridgePacket, first_readback_captured) == 572 ? 1 : -1];
 typedef char packet_action_check[offsetof(BridgePacket, action_bsa) == 592 ? 1 : -1];
 typedef char packet_action_context_check[offsetof(BridgePacket, action_x18_after) == 632 ? 1 : -1];
+typedef char packet_previous_pose_check[offsetof(BridgePacket, previous_position) == 704 ? 1 : -1];
+typedef char packet_motion_delta_check[offsetof(BridgePacket, position_delta_squared) == 752 ? 1 : -1];
 extern BridgePacket packet;
 extern gsize g_key18, g_keygate, g_keytls, g_keytlr;
 extern guint8 dm_gate_stubs[];
@@ -106,10 +111,12 @@ extern gint region_info(guint32 task, guint64 *address, guint64 *size,
 extern gint port_deallocate(guint32 task, guint32 object);
 
 // States: 1 armed, 2 claimed/awaiting original Main return, 3 finished,
-// 4 cancelled, 5 awaiting another read-only validation frame, 6 actor phase claimed.
+// 4 cancelled, 5 awaiting another read-only validation frame, 6 actor phase claimed,
+// 7 Wait accepted; awaiting a strictly later actor update before the one-shot warp.
 gint cancel_pending(void) {
   native_cas(0, 1, &packet.cancel_requested);
-  if (native_cas(1, 4, &packet.state) || native_cas(5, 4, &packet.state))
+  if (native_cas(1, 4, &packet.state) || native_cas(5, 4, &packet.state) ||
+      native_cas(7, 4, &packet.state))
     packet.diagnostic_phase = 16;
   return packet.state;
 }
@@ -225,6 +232,35 @@ static guint checkpoint_readback(void) {
   }
   return stable;
 }
+// Only distinct guest frames advance this baseline. Duplicate Main callbacks
+// must not hide movement by replacing it with a sample from the same frame.
+static guint checkpoint_motion_stable(void) {
+  guint i, stable = 1;
+  packet.position_delta_squared = 0;
+  packet.rotation_delta = 0;
+  if (packet.previous_pose_valid) {
+    if (packet.frame_after != packet.last_sample_frame + 1) stable = 0;
+    for (i = 0; i != 3; ++i) {
+      float delta = packet.position_after[i] - packet.previous_position[i];
+      packet.position_delta_squared += delta * delta;
+    }
+    for (i = 0; i != 9; ++i) {
+      float delta = packet.rotation_after[i] - packet.previous_rotation[i];
+      if (delta != delta) stable = 0;
+      if (delta < 0) delta = -delta;
+      if (delta > packet.rotation_delta) packet.rotation_delta = delta;
+    }
+    // Settled pilot drift was about .00056/frame; the carried-motion case was
+    // about .0225/frame. These per-game limits retain the anchor bounds too.
+    if (packet.position_delta_squared != packet.position_delta_squared ||
+        packet.position_delta_squared > .005f * .005f ||
+        packet.rotation_delta > .005f) stable = 0;
+  }
+  for (i = 0; i != 3; ++i) packet.previous_position[i] = packet.position_after[i];
+  for (i = 0; i != 9; ++i) packet.previous_rotation[i] = packet.rotation_after[i];
+  packet.previous_pose_valid = 1;
+  return stable;
+}
 static void enter_bridge(GumInvocationContext *ic, guint actor_phase) {
   guint *claimed = (guint *)gum_invocation_context_get_listener_invocation_data(
       ic, sizeof(guint));
@@ -236,14 +272,26 @@ static void enter_bridge(GumInvocationContext *ic, guint actor_phase) {
   gpointer saved_x18;
   *claimed = 0;
   if (actor_phase) {
-    if (!packet.action_enabled || packet.mode != 2 || packet.action_called ||
+    if (!packet.action_enabled || packet.mode != 2 || packet.warp_called ||
         ic->cpu_context->x[20] != packet.player || ic->cpu_context->x[24] != packet.action_bsa) return;
-    if (!native_cas(1, 6, &packet.state)) return;
+    if (packet.action_called) {
+      if (frame_now() <= packet.action_frame || !native_cas(7, 6, &packet.state)) return;
+    } else if (!native_cas(1, 6, &packet.state)) return;
   } else {
-    // The action variant waits for the normal actor phase after its slot clears.
-    if (packet.action_enabled && packet.mode == 2) return;
     if (packet.expected_tid && packet.expected_tid != tid) return;
     if (packet.expected_instance && packet.expected_instance != instance) return;
+    // Main cannot execute either action stage. It still bounds a missing actor
+    // update after Wait, using a separate guest-frame deadline before warp.
+    if (packet.action_enabled && packet.mode == 2) {
+      guint64 now = frame_now();
+      if (packet.state != 7 || now < packet.action_frame ||
+          now - packet.action_frame < 60 || !native_cas(7, 2, &packet.state)) return;
+      *claimed = 1;
+      packet.frame_before = now;
+      packet.error = 19;
+      packet.diagnostic_phase = 21;
+      return;
+    }
     if (!native_cas(1, 2, &packet.state) && !native_cas(5, 2, &packet.state)) return;
   }
   *claimed = 1;
@@ -275,7 +323,7 @@ static void enter_bridge(GumInvocationContext *ic, guint actor_phase) {
   }
   packet.gate_slot = gate_delta / 16;
   packet.gate_top = dm_gate_top[packet.gate_slot];
-  if (actor_phase) {
+  if (actor_phase && !packet.action_called) {
     packet.action_frame = packet.frame_before;
     packet.action_guest_sp = packet.guest_sp;
     packet.action_callback_sp = packet.callback_sp;
@@ -314,8 +362,25 @@ static void enter_bridge(GumInvocationContext *ic, guint actor_phase) {
       }
     }
     if (packet.mode == 2 && packet.action_enabled) {
-      reset_action(saved_x18);
-      if (packet.error || packet.cancel_requested) return;
+      guint selected;
+      if (packet.cancel_requested) return;
+      if (!packet.action_called) {
+        reset_action(saved_x18);
+        // Resume the ordinary scheduler/update before attempting placement.
+        // on_action_enter publishes state7 only after context restoration.
+        return;
+      }
+      if (packet.frame_before <= packet.action_frame ||
+          packet.frame_before - packet.action_frame >= 60) { packet.error = 19; return; }
+      packet.error = action_identity();
+      if (packet.error) return;
+      if (*(guint8 *)(gsize)(packet.action_slot0 + 0x7c) & 2) { packet.error = 15; return; }
+      packet.action_requested = *(guint32 *)(gsize)(packet.action_slot0 + 0x4c);
+      selected = *(guint32 *)(gsize)(packet.action_slot0 + 0x28);
+      packet.action_selected = selected == 0x11a ? packet.action_requested : selected;
+      if (!packet.action_returned || !packet.action_context_restored || packet.action_result ||
+          packet.action_requested != 40 || packet.action_selected != 40) { packet.error = 18; return; }
+      if (packet.cancel_requested) return;
     }
     packet.diagnostic_phase = 4;
     // Ordinary native ABI call from this C callback's measured stack. No JS FFI.
@@ -364,9 +429,12 @@ void on_action_enter(GumInvocationContext *ic) {
     packet.diagnostic_phase = 16; native_cas(6, 4, &packet.state);
   } else if (packet.error) {
     packet.diagnostic_phase = 15; native_cas(6, 3, &packet.state);
+  } else if (!packet.warp_called) {
+    packet.diagnostic_phase = 20;
+    native_cas(6, 7, &packet.state);
   } else {
-    // The original actor update resumes after this callback. Main reads the
-    // resulting pose on following updates; action and warp are never repeated.
+    // Only the later actor callback places the player. Main now reads the
+    // resulting pose; neither action nor warp is repeated on instability.
     packet.mode = 3;
     packet.diagnostic_phase = 14;
     native_cas(6, 5, &packet.state);
@@ -384,6 +452,8 @@ void on_leave(GumInvocationContext *ic) {
     packet.diagnostic_phase = 12;
     ++packet.readback_count;
     stable = checkpoint_readback();
+    if (!packet.error && packet.frame_after != packet.last_sample_frame)
+      stable = checkpoint_motion_stable() && stable;
     packet.last_readback_stable = stable;
     if (!packet.first_readback_captured) {
       guint i;
@@ -598,7 +668,8 @@ const DIAGNOSTIC_PHASES = ['idle', 'callback_entered', 'identity_checked',
   'permission_check_before_warp', 'ready_for_warp', 'warp_entered', 'warp_returned',
   'thread_context_restored', 'permission_check_before_health', 'health_commit_finished',
   'enter_callback_returning', 'leave_entered', 'readback_entered', 'readback_returned',
-  'waiting_stability', 'completed', 'cancelled', 'action_entered', 'action_returned', 'action_context_restored'];
+  'waiting_stability', 'completed', 'cancelled', 'action_entered', 'action_returned', 'action_context_restored',
+  'waiting_later_actor_update', 'pre_warp_deadline'];
 function physicsObservation(run) {
   // Bounded, read-only and deliberately non-atomic. Typed body-cache fields
   // require the exact controller transform method used by the inspected build.
@@ -671,8 +742,10 @@ function diagnostics(run) {
     native_mode: u32(OFF.mode), state_before: stateBefore, error_code: u32(OFF.error),
     error_name: ({13: 'post_warp_stability_timeout', 14: 'action_identity_mismatch',
       15: 'action_slot_busy', 16: 'action_request_rejected', 17: 'action_context_mismatch',
-      18: 'action_selection_mismatch'})[u32(OFF.error)] || null,
-    post_warp_frame_budget: 60,
+      18: 'action_selection_mismatch', 19: 'pre_warp_actor_timeout'})[u32(OFF.error)] || null,
+    pre_warp_frame_budget: 60, post_warp_frame_budget: 60,
+    motion_delta: {position: Math.sqrt(p.add(OFF.positionDeltaSquared).readFloat()),
+      rotation_element: p.add(OFF.rotationDelta).readFloat(), limit: 0.005},
     action_reset: {enabled: u32(OFF.actionEnabled) === 1, called: u32(OFF.actionCalled) === 1,
       returned: u32(OFF.actionReturned) === 1, result: p.add(OFF.actionResult).readS32(),
       context_restored: u32(OFF.actionContextRestored) === 1,

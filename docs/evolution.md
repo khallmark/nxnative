@@ -120,8 +120,10 @@ not automatic game identification.
 
 This reset keeps the current world loaded. It validates a native callback on the
 guest stack, restores the player's physics/controller pose and health, preserves
-the thread's virtual registers, and requires repeated distinct-frame readback
-before reporting `restored`. It does not restore camera state, actors, random
+the thread's virtual registers, and requires consecutive-frame readback
+before reporting `restored`. The Ocarina bridge also bounds frame-to-frame position
+and rotation-element change to 0.005, retaining the absolute anchor checks; being
+inside the anchor tolerance alone does not prove the player stopped moving. It does not restore camera state, actors, random
 state, animation, inventory or quest progress. It is a **player checkpoint**;
 candidates encounter a continuously evolving world. Do not compare its fitness
 with experiments that reload the entire scene.
@@ -153,6 +155,16 @@ current writable health pages before mutation. Hooks detach after each restore,
 and explicit shutdown unloads the idle script. The profile records measured
 startup and warm-reset latency; automatic death retry must be measured separately.
 A successful native call alone does not certify a completed end-to-end retry.
+With Ocarina's opt-in action reset, the engine Wait request and warp occur on
+separate actor updates, with ownership/context checks at each stage. Cancellation
+can release the pending interval without a warp; pre-warp and post-warp guest
+frame deadlines are independent. Neither action nor warp is repeated to hide a
+failed stability check.
+
+A descriptor-restoration ACK proves only the bridge's cleanup contract. Frida
+script unload has its own instrumentation teardown barrier and may still fail.
+A cancelled unload is not permission to assume teardown finished or to reattach;
+retain the original failure and independent cleanup diagnostics.
 
 ### World-direction movement genes
 

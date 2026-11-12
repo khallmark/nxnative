@@ -135,12 +135,17 @@ after 60 guest frames instead of waiting through further damage.
 The opt-in `reset_action: true` candidate first requests the engine's `Wait`
 action (verb 40, slot 0) at `main+0xcba80`, after the actor update clears its
 execution flags and before scheduler evaluation. It calls `main+0xc08f0` once,
-checks acceptance and the selected action, then warps. Bind fresh `action_bsa`,
+checks acceptance and the selected action, then allows the normal actor update
+to proceed before warping on a strictly later actor frame. The request executes
+synchronously; this separation does not assume deferred action execution. The
+later callback revalidates ownership, stack/context, health permissions and
+selected Wait without requesting it again. A separate 60-frame pre-warp deadline
+bounds a missing actor callback. Bind fresh `action_bsa`,
 `action_bsa_vtable` and `action_slot0` addresses and both extra code fingerprints.
 The callback verifies actor/BSA registers, ownership, the native stack and thread
 context. Main performs the subsequent stability reads. The default leaves this
-experimental action request disabled. A controlled lethal pilot on a fresh host
-passed: after a recorded artificial health change from 10 to 1, a real boulder
+experimental action request disabled. Before separating the action and warp,
+a controlled lethal pilot on a fresh host passed: after a recorded artificial health change from 10 to 1, a real boulder
 hit produced terminal health 0 at frame 9137. The action request and warp ran at
 9140, then frames 9141–9143 verified the checkpoint and health 10. Python measured
 104.55 ms from reset request to verification, with no menu input. This probe has
@@ -149,6 +154,22 @@ ending with health 1, and automatically restored checkpoint health 10 in 107.69
 and 114.89 ms. The first terminal-to-next-start gap was eight guest frames.
 A natural lethal cycle starting at the normal checkpoint health remains under
 observation; the diagnostic injury is not mixed into its fitness.
+
+A later movement/camera pilot exposed resumed movement after a successful warp:
+frame 10262 placed the player; the first readback at 10263 matched the anchor and
+health 10, but after 60 readbacks the player was 0.4568 units away and rotation
+matrix error reached 0.9828. No health, identity or native-call error explained
+that drift. Earlier accepted resets moved 0.045 units within their acceptance
+window. The candidate now also requires consecutive-frame position and maximum
+rotation-element changes of at most 0.005; duplicate and skipped frames cannot
+manufacture a stationary proof. The existing anchor/health bounds and post-warp
+60-frame deadline remain. The two-stage change is under live validation.
+
+After that failed pilot, both script unload calls timed out despite restored
+instruction bytes and a successful completed-state snapshot. The cause remains
+unresolved; descriptor restoration is not an unload acknowledgement. Continuous
+training resumed with normal Load recovery and no fresh instrumentation attachment
+to that process. All 14 save hashes remained verified.
 
 The camera-direction calibration is supported by 110 archived walking intervals:
 projected matrix columns predict travel with median angular error 2.83 degrees,
@@ -160,7 +181,13 @@ actor. The vtable alone is shared with other actors. The host's optional
 can bind self and vtable while the session validates the name. No active-camera
 global was proved; this is calibrated for ordinary gameplay, not cutscenes.
 Standalone X input produced a measured 0.62-unit jump arc with unchanged health;
-A as dash and Y as attack remain unverified.
+A as dash and Y as attack remain unverified. Three 12-frame world-direction
+trials spanning 106.8 degrees of camera yaw had 4.05 degrees of movement-heading
+spread and 0.0742 units of endpoint spread, with unchanged health. The subsequent
+no-button/A/B pairs did not establish a reliable speed-only gain. A six-second
+route probe and subsequent genetic trials still have no verified target landing.
+Shorter 600-frame route qualification is explicitly censored; 7200-frame survival
+validation belongs to a separate experiment and imports genes, not fitness.
 
 This player checkpoint keeps camera, hazards, animation, random state, inventory
 and quest progress running. Session addresses need fresh discovery after a process
