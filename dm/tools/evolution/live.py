@@ -229,12 +229,18 @@ def validate_ui(config):
     mutable=recovery.get('mutable_after_death',{})
     if not isinstance(mutable,dict) or (mutable and not death) or any(path not in recovery['files'] or type(limit) is not int or not 1<=limit<=16*1024*1024 for path,limit in mutable.items()):
         raise ValueError('Death metadata needs known save paths and bounded byte limits')
+    quiet=recovery.get('death_metadata_quiet_seconds',.5)
+    timeout=recovery.get('death_metadata_timeout_seconds',5.)
+    if type(quiet) not in (int,float) or not math.isfinite(quiet) or not .05<=quiet<=10:
+        raise ValueError('Invalid death metadata quiet interval')
+    if type(timeout) not in (int,float) or not math.isfinite(timeout) or not quiet<=timeout<=60:
+        raise ValueError('Invalid death metadata timeout')
 
 
 class Checkpoint:
-    """Replay a verified normal-game Load flow; never write game memory or saves."""
-    def __init__(self,bridge,log):
-        self.bridge=bridge;self.log=log
+    """Verify a normal-game Load, using an explicitly supplied reset backend if set."""
+    def __init__(self,bridge,log,reset_backend=None):
+        self.bridge=bridge;self.log=log;self.reset_backend=reset_backend
         self.config=bridge.config['recovery']
         self.expected=dict(self.config['files'])
         path=bridge.config.get('checkpoint_state')
@@ -268,16 +274,46 @@ class Checkpoint:
         if not ui_matches(self.bridge.config,state,'gameplay') or not in_bounds(state,task) or state['health']<task.get('start_health',task['min_health']) or distance(state['position'],task['start'])>task.get('start_tolerance',.3):
             raise TrialStopped('Loaded checkpoint does not match the declared start/health')
 
-    def accept_death_metadata(self,state,task):
+    def read_death_metadata(self):
+        mutable=self.config.get('mutable_after_death',{})
+        self.verify_files(ignore=mutable)
+        metadata={}
+        for path,limit in mutable.items():
+            try:
+                with Path(path).open('rb') as source:data=source.read(limit+1)
+            except OSError as exc:raise TrialStopped('Cannot read death metadata: '+path) from exc
+            if not data or len(data)>limit:raise TrialStopped('Unexpected death metadata size: '+path)
+            metadata[path]=data
+        return metadata
+
+    def settle_death_metadata(self,state,task):
+        # The game's asynchronous option save can finish after gameplay returns.
+        # A quiet interval is bounded evidence, not a save-completion notification;
+        # restore therefore reconciles once more after its final normal Load.
+        self.validate_anchor(state,task)
+        if not self.config.get('mutable_after_death'):return state
+        quiet=self.config.get('death_metadata_quiet_seconds',.5)
+        deadline=time.monotonic()+self.config.get('death_metadata_timeout_seconds',5.)
+        previous=self.read_death_metadata();unchanged_since=time.monotonic()
+        while True:
+            state=self.bridge.sample(actors=False)
+            self.validate_anchor(state,task)
+            metadata=self.read_death_metadata();now=time.monotonic()
+            if metadata!=previous:previous=metadata;unchanged_since=now
+            if now-unchanged_since>=quiet:
+                self.accept_death_metadata(state,task,metadata)
+                return state
+            if now>=deadline:raise TrialStopped('Death metadata did not become quiescent before timeout')
+            getattr(self.bridge,'settle',time.sleep)(min(.1,deadline-now))
+
+    def accept_death_metadata(self,state,task,metadata=None):
         # Only a calibrated normal-game death transition may refresh these hashes.
         # Progress/caption files remain strict unless explicitly named by the profile.
         self.validate_anchor(state,task)
         mutable=self.config.get('mutable_after_death',{})
-        self.verify_files(ignore=mutable)
+        if metadata is None:metadata=self.read_death_metadata()
         updates={}
-        for path,limit in mutable.items():
-            with Path(path).open('rb') as source:data=source.read(limit+1)
-            if not data or len(data)>limit:raise TrialStopped('Unexpected death metadata size: '+path)
+        for path,data in metadata.items():
             digest=hashlib.sha256(data).hexdigest()
             if digest!=self.expected[path]:
                 archive=self.bridge.root/'death-metadata';archive.mkdir(exist_ok=True)
@@ -294,7 +330,8 @@ class Checkpoint:
     def restore(self,task):
         self.verify_files()
         state=self.bridge.sample(actors=False)
-        steps=self.config['steps'];death_count=0
+        steps=[] if self.reset_backend is not None else self.config['steps']
+        death_count=0;death_verified=False
         if state['health']==0:
             if not self.config.get('death_steps'):
                 raise TrialStopped('Death recovery has not been calibrated')
@@ -308,12 +345,29 @@ class Checkpoint:
                 # Other menu inputs are never retried on an uncertain result.
                 getattr(self.bridge,'settle',time.sleep)(step.get('settle',.3))
                 state=self.bridge.wait_ui(step['after'],step.get('timeout',3.))
-            if death_count and index+1==death_count:self.accept_death_metadata(state,task)
+            if death_count and index+1==death_count:
+                state=self.settle_death_metadata(state,task)
+                death_verified=True
             self.log.write(json.dumps(dict(event='recovery_step',step=index,state=state))+'\n')
             self.log.flush()
-        self.verify_files()
-        state=self.bridge.sample('',.3,actors=False)
+        if self.reset_backend is not None:
+            status=self.bridge.rpc('replay_status')
+            if status['active'] or self.bridge.episode_epoch is not None:
+                raise TrialStopped('Fast reset requires inactive native replay')
+            state=self.bridge.sample(actors=False)
+            if state['health']<=0 or not ui_matches(self.bridge.config,state,'gameplay'):
+                raise TrialStopped('Fast reset requires living gameplay')
+            self.reset_backend.restore(task)
+        # A player checkpoint already proved stability on distinct native frames.
+        # Its independent final read needs no additional 300 ms neutral replay.
+        if self.reset_backend is not None and getattr(self.reset_backend,'verified_player_checkpoint',False):
+            state=self.bridge.sample(actors=False)
+        else:state=self.bridge.sample('',.3,actors=False)
         self.validate_anchor(state,task)
+        # The permission expires with this restore call: an ordinary Load (including
+        # the next restore) must never bless a changed option or progress file.
+        if death_verified:state=self.settle_death_metadata(state,task)
+        self.verify_files()
         if self.bridge.config.get('actor_discovery'):
             state=self.bridge.wait_actors()
         self.log.write(json.dumps(dict(event='checkpoint_restored',state=state))+'\n')

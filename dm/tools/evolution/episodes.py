@@ -18,10 +18,18 @@ def validate_episode(spec):
 
 
 class NativeEpisodes:
-    def __init__(self,bridge,spec,log):
+    def __init__(self,bridge,spec,log,reset_backend=None):
         validate_episode(spec)
-        self.bridge=bridge;self.spec=spec;self.log=log
-        self.checkpoint=Checkpoint(bridge,log)
+        self.bridge=bridge;self.spec=spec;self.log=log;self.reset_backend=reset_backend
+        # The UI mirror can lag the authoritative health store used by a native
+        # lethal-damage callback. Keep scoring telemetry and guard binding separate.
+        address=bridge.config.get('native_guard_health_address',bridge.config['reads']['health']['address'])
+        try:
+            if not isinstance(address,str) or not address.startswith('0x'):raise ValueError
+            self.health_address=int(address,16)
+            if not 0<self.health_address<=2**64-5 or self.health_address%4:raise ValueError
+        except ValueError as exc:raise ValueError('Invalid native health guard address') from exc
+        self.checkpoint=Checkpoint(bridge,log,reset_backend)
         # Recovery verifies the exact anchor and health. These broad bounds only
         # reject impossible telemetry; episode damage and falling do not stop play.
         self.task=dict(start=spec['start'],start_tolerance=spec.get('start_tolerance',.3),
@@ -43,10 +51,12 @@ class NativeEpisodes:
         scorer=EpisodeScore(initial['position'],s['target'],s['horizon_frames'],s.get('tolerance',.5))
         scorer.observe(0,initial['position'],initial['health'])
         compiled=time.perf_counter();timeline=compile_timeline(genome,s.get('segments',128),s['horizon_frames']);compile_seconds=time.perf_counter()-compiled
-        started=time.perf_counter();status=b.start_replay(timeline,int(b.config['reads']['health']['address'],0))
+        started=time.perf_counter();status=b.start_replay(timeline,self.health_address)
         start_frame=status['start_frame'];last_frame=start_frame;last_progress=started;max_skew=0;next_log=0
         try:
+            if self.reset_backend is not None:self.reset_backend.arm_episode(status,self.task,self.health_address)
             while True:
+                if self.reset_backend is not None:self.reset_backend.poll_episode()
                 state=b.sample(actors=False);status=b.native_status
                 observed_end=status.get('observed_frame_end')
                 if type(observed_end) is not int or observed_end<status['current_frame']:
@@ -83,4 +93,6 @@ class NativeEpisodes:
                                 observation_max_frame_skew=max_skew,native_epoch=status['epoch'])
                 time.sleep(s.get('poll_seconds',.05))
         finally:
-            b.cancel_replay()
+            try:
+                if self.reset_backend is not None:self.reset_backend.finish_episode(status)
+            finally:b.cancel_replay()

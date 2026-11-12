@@ -88,6 +88,43 @@ Run headless, `DM_CTL` at a control file. The work folder has `boot.sh <secs> <l
 
 From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. From `save_ref`: at about 58 s `A~0.2`, 5 s later `A~0.2` (Load), 30 s later three `A~0.1` 3 s apart, then 12 s to the bridge outside Link's house. There `LUp~3.5`, `A~0.2` (Climb Down) and `LDown~4` three or four times reach the village floor.
 
+## In-place training checkpoints
+
+Current, Mac only, NSO build `e0f3ccfaf50065ae4ea01eb5aeb13b1a`: the optional
+[`player_checkpoint.js`](player_checkpoint.js) bridge restores a calibrated player
+pose and health while the scene remains loaded. Its generic runner contract is in
+[the evolution guide](../../../docs/evolution.md#in-place-player-checkpoints).
+The native player/controller warp is `main+0xc6fb30`, called with a row-major
+Matrix34 and mode0 from the game-stack callback at `main+0x3303ca0`. The bridge
+checks the native stack and host-gate bounds and restores virtual x18; direct
+JavaScript FFI calls into guest code are not a substitute for that bridge.
+
+The authoritative health record is reached from player components at `+0x270`,
+entry87, life component `+0x1c10`, record `+8`. The life component's `+0x1ca8`
+value is a mirror. Ownership, vtables, pointer chain, gameplay UI and current
+writable memory are checked before health changes. The optional
+[`lethal_checkpoint.js`](lethal_checkpoint.js) observes the damage CAS at
+`main+0x49dcf8` and its success-only continuation at `main+0x49dd08`; it requests
+[atomic native terminal recovery](../../../docs/reference/threads.md#native-replay-terminal-events-before-checkpoint-restoration)
+for the exact replay epoch. Its initial preparation installs no hooks.
+
+Measured in a Kokiri Forest training session on2026-11-12: three player restores
+matched the calibrated checkpoint position/rotation and health10, with all14 save
+hashes unchanged. Repeated uncached range checks cost5.68–5.80s; an independent
+read-only benchmark found a heap `Process.findRangeByAddress` lookup cost658–673ms,
+while CModule compilation cost0–1ms. Keeping validated spans and the bridge in
+one attachment reduced initial setup plus restore to1.432s and the next two
+complete restores to72.8ms and72.0ms. The native checkpoint used three distinct
+stable frames. Normal guarded Load retries in that session cost about13.6s.
+These are checkpoint request timings, not a claim of faster game simulation.
+
+This is a player checkpoint, not a world/RAM snapshot: camera, hazards, animation,
+random state, inventory and quest progress continue. Session addresses need fresh
+discovery after a process restart. Original save archives remain separate and
+unchanged. Continuous automatic death recovery with this bridge remains open
+until a real lethal-damage cycle is observed. No successful chest landing, sword,
+boss or ending has been established by this training run.
+
 ## Open
 
 - Root cause confirmed on M4 Pro (2026-11-08): [ignored event waits](../../../docs/reference/nvn-objects.md#gpu-event-waits-order-work-across-queues) let lighting consumers run before their producers. The game issues about 25 waits and 19 signals per frame. All 297 complete traced frames submit queue 5's ambient-cache consumer `9e6b00b050e30801` before queue 1's SH producer `21d9f83e6027c565`, despite the explicit dependency. Queue 1 also waits for the CPU frame-ready event after the CPU clears the lighting buffer. At frame 3872 the consumer ran at 0.686 ms, the clear at 0.966–0.968 ms, and the producer at 1.282 ms; its release followed at 4.467 ms. Exposure writer `1bba09ec4bc8ff67` has another event dependency. The native SDK's flush/invalidate functions are no-ops for these coherent pools.

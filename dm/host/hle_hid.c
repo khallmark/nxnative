@@ -321,6 +321,52 @@ static void replay_stop_locked(const char *reason) {
     replay_release(); g_replay.applied = -1; g_replay.reason = reason; g_replay.stop_frame = dm_guest_frame();
     atomic_store_explicit(&g_replay_on, 0, memory_order_release);
 }
+// A native game hook reports a committed threshold crossing before checkpoint recovery.
+// It must verify the health write succeeded; this API records the event, not a memory read.
+// Return 1 only for the active matching replay. Rejected or duplicate events change nothing.
+int dm_replay_terminal(uint64_t epoch, uint64_t guard_address, uint32_t old_health, uint32_t new_health) {
+    int accepted = 0;
+    pthread_mutex_lock(&g_sync_mu);
+    if (atomic_load_explicit(&g_replay_on, memory_order_relaxed) && g_replay.epoch == epoch &&
+        guard_address && g_replay.guard_address == guard_address &&
+        old_health > g_replay.guard_threshold && new_health <= g_replay.guard_threshold) {
+        g_replay.last_health = new_health; g_replay.health_valid = 1;
+        replay_stop_locked("death"); accepted = 1;
+    }
+    pthread_mutex_unlock(&g_sync_mu); return accepted;
+}
+// The post-write hook can recover health and stop the same replay in one transaction.
+// Address identity, actor lifetime and the checkpoint's maximum HP are the caller's
+// responsibility; validate writable storage here before the atomic replacement.
+int dm_replay_terminal_restore(uint64_t epoch, uint64_t guard_address, uint32_t old_health,
+                               uint32_t new_health, uint32_t checkpoint_health) {
+    int accepted = 0;
+    pthread_mutex_lock(&g_sync_mu);
+    int active = atomic_load_explicit(&g_replay_on, memory_order_relaxed);
+    int observed_death = !active && !strcmp(g_replay.reason, "death") &&
+                         g_replay.health_valid && g_replay.last_health == new_health;
+    if ((!active && !observed_death) || g_replay.epoch != epoch || !guard_address ||
+        (guard_address & 3) || guard_address > UINT64_MAX - sizeof(uint32_t) ||
+        g_replay.guard_address != guard_address || old_health <= g_replay.guard_threshold ||
+        new_health > g_replay.guard_threshold || checkpoint_health <= g_replay.guard_threshold) goto done;
+    mach_vm_address_t region = (mach_vm_address_t)guard_address; mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t result = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    if (result != KERN_SUCCESS || !(info.protection & VM_PROT_WRITE) ||
+        guard_address < region || size < sizeof(uint32_t) ||
+        guard_address - region > size - sizeof(uint32_t)) goto done;
+    uint32_t expected = new_health;
+    if (!atomic_compare_exchange_strong((_Atomic uint32_t *)(uintptr_t)guard_address,
+                                        &expected, checkpoint_health)) goto done;
+    g_replay.last_health = new_health; g_replay.health_valid = 1;
+    if (active) replay_stop_locked("death"); // A preceding HID death keeps its original terminal frame.
+    accepted = 1;
+done:
+    pthread_mutex_unlock(&g_sync_mu); return accepted;
+}
 // Called at native HID reads, once per guest frame for the guard. No Python round trip.
 static int replay_sync(void) {
     if (!atomic_load_explicit(&g_replay_on, memory_order_acquire)) return 0;

@@ -69,7 +69,12 @@ sizes. Every path must already have a starting hash in `files`. After the guarde
 death flow returns to the exact anchor with sufficient health, all other hashes
 must still match. The adapter archives each new metadata value, logs its old/new
 hashes, and atomically persists the accepted hashes in `checkpoint-state.json`
-for resume. It never writes game saves. Before death and during ordinary Load,
+for resume. Asynchronous metadata writes must remain unchanged for
+`recovery.death_metadata_quiet_seconds` (default 0.5) within
+`recovery.death_metadata_timeout_seconds` (default 5). The runner reconciles again
+after the final normal Load, only within that same verified death recovery.
+This bounded quiet interval is not a game-provided save-completion signal.
+It never writes game saves. Before death and during a separate ordinary Load,
 all files remain strict. Do not include progress/caption files merely to bypass
 a failure; such a change needs a newly verified checkpoint and experiment.
 
@@ -89,6 +94,52 @@ time, frames per wall second, reset time and attempts per minute. The native
 life. Memory reads are asynchronous, with start/end frame brackets reported as
 observation skew. Measure actual throughput and behavior before claiming speedup
 from `DM_DETCLOCK` or headless mode; a fast timeline compiler is not fast gameplay.
+
+### In-place player checkpoints
+
+The native runner accepts an optional `fast_reset` session object. Its `script`
+is an absolute path to a UTF-8 Frida script, pinned by a full `sha256`; `pid`,
+`build_id`, `mainbase`, and `address_binding` bind it to the verified live game.
+`timeout_seconds` bounds requests to 0.1–60 seconds. The optional Python `frida`
+package must be available in the runner's interpreter. Script bytes, Frida version,
+reset implementation and configuration join the experiment fingerprint.
+
+The [Ocarina profile](../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints)
+provides a Darwin arm64 bridge with its own build and code offsets. Use mode
+`player_checkpoint`, a captured nine-float `target_rotation`, and the profile's
+session bindings for `player`, `hud_flags`, `plus_flags` and `code_fingerprints`.
+The objective supplies the start position and health. These bindings must be
+rediscovered after a restart; the build ID is an explicit operator binding,
+not automatic game identification.
+
+This reset keeps the current world loaded. It validates a native callback on the
+guest stack, restores the player's physics/controller pose and health, preserves
+the thread's virtual registers, and requires repeated distinct-frame readback
+before reporting `restored`. It does not restore camera state, actors, random
+state, animation, inventory or quest progress. It is a **player checkpoint**;
+candidates encounter a continuously evolving world. Do not compare its fitness
+with experiments that reload the entire scene.
+
+Only an inactive native replay and positively identified living gameplay may use
+this reset path. Save hashes remain strict. A failed or uncertain reset stops the
+runner; there is no automatic menu fallback. Cleanup waits for native callbacks
+to finish before removing instrumentation. An uncertain reset also suppresses the
+runner's normal Plus-button cleanup because the screen may be transitioning.
+Ordinary Game Over recovery remains necessary unless a separately verified lethal
+damage hook has prevented entry into that flow.
+
+The optional top-level `native_guard_health_address` selects an aligned u32
+address for the native terminal guard independently of the `health` telemetry
+mirror. It defaults to `reads.health.address`. Use the authoritative health store
+when a native damage callback is bound to that store; the existing two-u32 mirror
+still supplies current/max telemetry. Both addresses need runtime identity proof.
+
+The bridge and validated mapping spans remain resident across successful resets;
+each retry still rereads code, actor ownership, health and UI. Native checks verify
+current writable health pages before mutation. Hooks detach after each restore,
+and explicit shutdown unloads the idle script. The profile records measured
+startup and warm-reset latency; automatic death retry must be measured separately.
+A successful native call alone does not certify a completed end-to-end retry.
 
 ### Native replay protocol
 

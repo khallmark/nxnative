@@ -23,7 +23,7 @@ class FakeBridge:
         if self.calls==1:return dict(position=[0,0,0],health=10,reads={'hud':[1]})
         self.native_status,health=next(self.rows)
         return dict(position=[1,0,0],health=health,reads={'hud':[1]})
-    def start_replay(self,*args):return dict(start_frame=100)
+    def start_replay(self,*args):self.replay_args=args;return dict(start_frame=100,epoch=7)
     def cancel_replay(self):self.cancelled+=1
 
 
@@ -33,12 +33,48 @@ def status(frame,active=True,reason='running',health=10,stop=0):
 
 
 class EpisodeTests(unittest.TestCase):
-    def run_episode(self,rows):
+    def run_episode(self,rows,address=None):
         bridge=FakeBridge(rows)
+        if address is not None:bridge.config['native_guard_health_address']=address
         spec=dict(start=[0,0,0],target=[10,0,0],horizon_frames=100,start_health=10,segments=1)
         with patch('evolution.episodes.time.sleep'):
             result=NativeEpisodes(bridge,spec,io.StringIO()).evaluate(seed_genome(1))
         return result,bridge
+
+    def test_authoritative_guard_keeps_mirror_telemetry_separate(self):
+        for address,expected in [(None,0x1000),('0x2000',0x2000)]:
+            _,bridge=self.run_episode([(status(200,False,'completed',10,200),10)],address)
+            self.assertEqual(bridge.replay_args[1],expected)
+            self.assertEqual(bridge.config['reads']['health']['address'],'0x1000')
+
+    def test_invalid_native_guard_never_installs_timeline(self):
+        for address in [True,12,'nope','0x0','0x1001','0xfffffffffffffffc']:
+            with self.subTest(address=address),self.assertRaisesRegex(ValueError,'native health guard'):
+                self.run_episode([],address)
+
+    def test_lethal_hook_epoch_and_cleanup_bracket_native_episode(self):
+        bridge=FakeBridge([(status(140,False,'death',0,120),10)])
+        events=[]
+        class Backend:
+            def arm_episode(self,status,task,address):events.append(('arm',status['epoch'],address))
+            def poll_episode(self):events.append('poll')
+            def finish_episode(self,status):events.append(('finish',status['reason'],status['last_health']))
+        bridge.cancel_replay=lambda:events.append('cancel_replay')
+        spec=dict(start=[0,0,0],target=[10,0,0],horizon_frames=100,start_health=10,segments=1)
+        result=NativeEpisodes(bridge,spec,io.StringIO(),Backend()).evaluate(seed_genome(1))
+        self.assertEqual(result['reason'],'death');self.assertEqual(result['health'],0)
+        self.assertEqual(events,[('arm',7,0x1000),'poll',('finish','death',0),'cancel_replay'])
+
+    def test_lethal_arm_failure_still_releases_hooks_before_cancelling_replay(self):
+        bridge=FakeBridge([]);events=[]
+        class Backend:
+            def arm_episode(self,*args):events.append('arm');raise TrialStopped('lethal arm failed')
+            def finish_episode(self,status):events.append('finish')
+        bridge.cancel_replay=lambda:events.append('cancel_replay')
+        spec=dict(start=[0,0,0],target=[10,0,0],horizon_frames=100,start_health=10,segments=1)
+        with self.assertRaisesRegex(TrialStopped,'lethal arm failed'):
+            NativeEpisodes(bridge,spec,io.StringIO(),Backend()).evaluate(seed_genome(1))
+        self.assertEqual(events,['arm','finish','cancel_replay'])
 
     def test_visible_hud_at_death_is_not_gameplay(self):
         config={'ui':{'gameplay':[dict(read='hud',equals=1)]}}

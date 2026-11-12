@@ -12,6 +12,7 @@ from evolution.core import Evolution
 from evolution.episodes import NativeEpisodes,validate_episode
 from evolution.live import TrialStopped,ui_matches
 from evolution.replay import ReplayBridge
+from evolution.reset import FridaReset,prepare_fast_reset
 from evolution.timeline import gene_space,seed_genome
 
 
@@ -34,47 +35,59 @@ def main():
     config.pop('actor_discovery',None)
     args.output.mkdir(parents=True,exist_ok=True)
     config['checkpoint_state']=str((args.output/'checkpoint-state.json').resolve())
+    prepared=prepare_fast_reset(config)
     package=Path(__file__).resolve().parents[1]/'dm'/'tools'/'evolution'
-    implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py'))])+json.dumps(config,sort_keys=True).encode()).hexdigest()
+    implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py','reset.py'))])+json.dumps(config,sort_keys=True).encode()+(prepared.fingerprint() if prepared else b'')).hexdigest()
     initial=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else seed_genome(spec.get('segments',128),spec.get('initial_direction',[0,1]))
     evolution=Evolution(args.output/'evolution.sqlite',[spec],args.population,args.repeats,implementation=implementation,
                         bounds=gene_space(spec.get('segments',128)),initial_genome=initial,
                         mutation_rate=args.mutation_rate,mutation_sigma=args.mutation_sigma)
     def interrupt(signum,frame):raise KeyboardInterrupt
     signal.signal(signal.SIGTERM,interrupt)
-    bridge=None
+    bridge=None;backend=None;log=None
     try:
         bridge=ReplayBridge(config)
-        with (args.output/'trajectory.jsonl').open('a') as log:
-            env=NativeEpisodes(bridge,spec,log);env.checkpoint.verify_files()
-            status=bridge.rpc('replay_status')
-            if status['active']:raise TrialStopped('Another native timeline is active')
-            state=bridge.sample(actors=False)
-            if ui_matches(config,state,'pause'):bridge.unpause()
-            bridge.running=True
+        log=(args.output/'trajectory.jsonl').open('a')
+        backend=FridaReset(prepared,bridge,log) if prepared else None
+        env=NativeEpisodes(bridge,spec,log,backend);env.checkpoint.verify_files()
+        status=bridge.rpc('replay_status')
+        if status['active']:raise TrialStopped('Another native timeline is active')
+        state=bridge.sample(actors=False)
+        if ui_matches(config,state,'pause'):bridge.unpause()
+        bridge.running=True
+        _,reset_seconds=env.restore()
+        final=evolution.state['generation']+args.generations;run_start=time.perf_counter();attempts=0
+        while not args.generations or evolution.state['generation']<final:
+            key=evolution.pending()
+            if key is None:
+                report=evolution.advance();tmp=args.output/'champion.tmp'
+                tmp.write_text(json.dumps(report,indent=2)+'\n');tmp.replace(args.output/'champion.json')
+                print(json.dumps(dict(event='generation',**report)),flush=True);continue
+            print(json.dumps(dict(event='episode_started',key=key,genes=len(initial),reset_seconds=reset_seconds)),flush=True)
+            result=env.evaluate(evolution.state['candidates'][key[1]])
+            attempts+=1;result['reset_seconds']=reset_seconds
+            result['attempts_per_minute']=attempts*60/max(time.perf_counter()-run_start,1e-9)
+            evolution.record(key,result)
+            print(json.dumps(dict(event='episode_finished',key=key,**result)),flush=True)
             _,reset_seconds=env.restore()
-            final=evolution.state['generation']+args.generations;run_start=time.perf_counter();attempts=0
-            while not args.generations or evolution.state['generation']<final:
-                key=evolution.pending()
-                if key is None:
-                    report=evolution.advance();tmp=args.output/'champion.tmp'
-                    tmp.write_text(json.dumps(report,indent=2)+'\n');tmp.replace(args.output/'champion.json')
-                    print(json.dumps(dict(event='generation',**report)),flush=True);continue
-                print(json.dumps(dict(event='episode_started',key=key,genes=len(initial),reset_seconds=reset_seconds)),flush=True)
-                result=env.evaluate(evolution.state['candidates'][key[1]])
-                attempts+=1;result['reset_seconds']=reset_seconds
-                result['attempts_per_minute']=attempts*60/max(time.perf_counter()-run_start,1e-9)
-                evolution.record(key,result)
-                print(json.dumps(dict(event='episode_finished',key=key,**result)),flush=True)
-                _,reset_seconds=env.restore()
     except (TrialStopped,ValueError,OSError) as exc:
-        with (args.output/'interruptions.jsonl').open('a') as log:
-            log.write(json.dumps(dict(error=str(exc),state=bridge.last if bridge else None))+'\n')
+        with (args.output/'interruptions.jsonl').open('a') as interruptions:
+            interruptions.write(json.dumps(dict(error=str(exc),state=bridge.last if bridge else None))+'\n')
         raise
     finally:
         try:
-            if bridge is not None:bridge.close()
-        finally:evolution.db.close()
+            if backend is not None:
+                try:backend.close()
+                finally:
+                    # A queued game reload may outlive failed instrumentation.
+                    # Releasing native input is safe; a Plus/menu fallback is not.
+                    if backend.uncertain and bridge is not None:bridge.running=False
+        finally:
+            try:
+                if bridge is not None:bridge.close()
+            finally:
+                if log is not None:log.close()
+                evolution.db.close()
 
 
 if __name__=='__main__':

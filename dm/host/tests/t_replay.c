@@ -132,6 +132,108 @@ static void t_replay_health(void) {
     health = 0; test_install("f0:X~f2", (uint64_t)(uintptr_t)&health, 0);
     CHECK(test_input(606) == 0 && !strcmp(g_replay.reason, "death"), "already dead state never presses");
 }
+static void test_terminal_rejected(uint64_t epoch, uint64_t address, uint32_t old_health, uint32_t new_health, const char *why) {
+    replay_state before; memcpy(&before, &g_replay, sizeof before);
+    int active = atomic_load(&g_replay_on), down = touch_down, downs = touch_downs;
+    uint64_t buttons = atomic_load(&g_sc_btn), axes = atomic_load(&g_sc_axes);
+    uint64_t latch = atomic_load(&g_sc_latch), peek = atomic_load(&g_sc_peek_latch);
+    CHECK(!dm_replay_terminal(epoch, address, old_health, new_health), why);
+    CHECK(!memcmp(&before, &g_replay, sizeof before) && atomic_load(&g_replay_on) == active &&
+          atomic_load(&g_sc_btn) == buttons && atomic_load(&g_sc_axes) == axes &&
+          atomic_load(&g_sc_latch) == latch && atomic_load(&g_sc_peek_latch) == peek &&
+          touch_down == down && touch_downs == downs, "rejected terminal preserves replay and scripted input");
+}
+static void t_replay_terminal(void) {
+    replay_test_stop(); test_frame = 620;
+    uint32_t health = 6; uint64_t address = (uint64_t)(uintptr_t)&health;
+    CHECK(test_install("f0:A+L0.25/-0.5+T0.2x0.4~f20", address, 5), "install terminal replay");
+    uint64_t stale_epoch = g_replay.epoch;
+    CHECK(test_install("f0:A+L0.25/-0.5+T0.2x0.4~f20", address, 5), "replace terminal replay");
+    uint64_t epoch = g_replay.epoch;
+    test_frame = 621; keys_sync();
+    CHECK(atomic_load(&g_sc_btn) == DM_BTN_A && atomic_load(&g_sc_axes) &&
+          atomic_load(&g_sc_latch) == DM_BTN_A && atomic_load(&g_sc_peek_latch) == DM_BTN_A && touch_down,
+          "terminal test has held axes, touch and pending button edges");
+    test_terminal_rejected(stale_epoch, address, 6, 5, "old replay epoch cannot stop replacement");
+    test_terminal_rejected(epoch, address + sizeof health, 6, 5, "wrong health address rejected");
+    test_terminal_rejected(epoch, address, 7, 6, "nonterminal health result rejected");
+    test_terminal_rejected(epoch, address, 5, 0, "already terminal old health rejected");
+    dm_input_set(DM_BTN_B, 1234, 0, 0, 0);
+    CHECK(dm_replay_terminal(epoch, address, 6, 5), "matching committed threshold crossing accepted in same frame");
+    CHECK(!atomic_load(&g_replay_on) && !strcmp(g_replay.reason, "death") && g_replay.stop_frame == 621 &&
+          g_replay.epoch == epoch && g_replay.health_valid && g_replay.last_health == 5,
+          "native terminal freezes current death frame and event health without changing epoch");
+    CHECK(!atomic_load(&g_sc_btn) && !atomic_load(&g_sc_axes) && !atomic_load(&g_sc_latch) &&
+          !atomic_load(&g_sc_peek_latch) && !touch_down, "native terminal immediately releases scripted inputs");
+    CHECK(atomic_load(&g_btn) == DM_BTN_B && atomic_load(&g_axes) == pack(1234, 0, 0, 0) &&
+          (atomic_load(&g_latch) & DM_BTN_B) && (atomic_load(&g_peek_latch) & DM_BTN_B),
+          "native terminal preserves physical input and edges");
+    // The game has already recovered before the next HID read; fitness keeps the event.
+    health = 12; test_input(630);
+    CHECK(g_replay.stop_frame == 621 && g_replay.last_health == 5 && g_replay.epoch == epoch,
+          "health recovery and later HID reads cannot replace terminal timing or health");
+    test_terminal_rejected(epoch, address, 6, 0, "duplicate inactive terminal rejected");
+    dm_input_set(0, 0, 0, 0, 0); atomic_store(&g_latch, 0); atomic_store(&g_peek_latch, 0);
+    CHECK(test_install("f0:X~f20", 0, 0), "install replay without a health guard");
+    test_terminal_rejected(g_replay.epoch, 0, 1, 0, "unguarded replay cannot accept terminal event");
+    replay_test_stop();
+    CHECK(test_install("f0:X~f20", address, 0), "install zero-threshold terminal replay");
+    epoch = g_replay.epoch; test_input(631); test_frame = 633;
+    CHECK(dm_replay_terminal(epoch, address, 1, 0) && g_replay.stop_frame == 633 &&
+          g_replay.last_frame == 631 && g_replay.last_health == 0 && g_replay.epoch == epoch,
+          "terminal frame is callback frame, even before the next HID read");
+}
+static void t_replay_terminal_restore(void) {
+    replay_test_stop(); test_frame = 640;
+    uint32_t health = 6; uint64_t address = (uint64_t)(uintptr_t)&health;
+    CHECK(test_install("f0:A+L0/1~f20", address, 0), "install terminal recovery replay");
+    uint64_t epoch = g_replay.epoch; test_input(641); health = 0;
+    CHECK(!dm_replay_terminal_restore(epoch - 1, address, 6, 0, 10) && !health && atomic_load(&g_replay_on),
+          "stale epoch cannot recover health");
+    CHECK(!dm_replay_terminal_restore(epoch, address + sizeof health, 6, 0, 10) && !health && atomic_load(&g_replay_on),
+          "wrong guard cannot recover health");
+    CHECK(!dm_replay_terminal_restore(epoch, address, 0, 0, 10) && !health &&
+          !dm_replay_terminal_restore(epoch, address, 6, 1, 10) && !health &&
+          !dm_replay_terminal_restore(epoch, address, 6, 0, 0) && !health && atomic_load(&g_replay_on),
+          "invalid crossing or terminal recovery HP rejected");
+    health = 4;
+    CHECK(!dm_replay_terminal_restore(epoch, address, 6, 0, 10) && health == 4 && atomic_load(&g_replay_on),
+          "failed health CAS leaves replay active and health unchanged");
+    health = 0; test_frame = 643;
+    CHECK(dm_replay_terminal_restore(epoch, address, 6, 0, 10) && health == 10 && !atomic_load(&g_replay_on) &&
+          g_replay.last_health == 0 && g_replay.health_valid && g_replay.stop_frame == 643 && g_replay.epoch == epoch &&
+          !strcmp(g_replay.reason, "death") && !atomic_load(&g_sc_btn) && !atomic_load(&g_sc_axes),
+          "successful CAS recovers HP and freezes terminal truth with input release");
+    CHECK(!dm_replay_terminal_restore(epoch, address, 6, 0, 10) && health == 10 && g_replay.stop_frame == 643,
+          "duplicate recovery cannot change HP or terminal frame");
+    test_frame = 650; test_install("f0:X~f20", address, 0); epoch = g_replay.epoch; test_input(651);
+    health = 0; test_input(652); test_frame = 653;
+    CHECK(dm_replay_terminal_restore(epoch, address, 10, 0, 10) && health == 10 && g_replay.stop_frame == 652,
+          "HID observing zero first still allows same-epoch recovery and keeps earlier death frame");
+    test_install("f0:X~f20", address, 0); epoch = g_replay.epoch; replay_test_stop(); health = 0;
+    CHECK(!dm_replay_terminal_restore(epoch, address, 10, 0, 10) && !health && !strcmp(g_replay.reason, "cancelled"),
+          "cancelled replay cannot recover health");
+    health = 10; test_frame = 660; test_install("f0:X~f1", address, 0); epoch = g_replay.epoch;
+    test_input(661); test_input(662); health = 0;
+    CHECK(!dm_replay_terminal_restore(epoch, address, 10, 0, 10) && !health && !strcmp(g_replay.reason, "completed"),
+          "completed replay cannot recover health");
+    health = 10; test_install("f0:X~f20", address, 0); epoch = g_replay.epoch;
+    test_install("f0:A~f20", address, 0); health = 0;
+    CHECK(!dm_replay_terminal_restore(epoch, address, 10, 0, 10) && !health && atomic_load(&g_replay_on),
+          "replaced replay cannot recover its former guard");
+    test_install("f0:X~f20", 4, 0); epoch = g_replay.epoch;
+    CHECK(!dm_replay_terminal_restore(epoch, 4, 10, 0, 10) && atomic_load(&g_replay_on), "unmapped recovery address safely rejected");
+    mach_vm_address_t page = 0;
+    CHECK(mach_vm_allocate(mach_task_self(), &page, 4096, VM_FLAGS_ANYWHERE) == KERN_SUCCESS, "allocate recovery guard test page");
+    if (page) {
+        *(uint32_t *)(uintptr_t)page = 0; test_install("f0:X~f20", page, 0); epoch = g_replay.epoch;
+        CHECK(mach_vm_protect(mach_task_self(), page, 4096, 0, VM_PROT_READ) == KERN_SUCCESS, "protect recovery page read-only");
+        CHECK(!dm_replay_terminal_restore(epoch, page, 10, 0, 10) && !*(uint32_t *)(uintptr_t)page && atomic_load(&g_replay_on),
+              "read-only recovery storage rejected without a write fault");
+        CHECK(mach_vm_deallocate(mach_task_self(), page, 4096) == KERN_SUCCESS, "remove recovery guard test page");
+    }
+    replay_test_stop();
+}
 static void test_write(const char *path, const char *text) {
     FILE *f = fopen(path, "w"); CHECK(f != NULL, "create test protocol file"); if (f) { CHECK(fputs(text, f) >= 0, "write test protocol file"); CHECK(!fclose(f), "close test protocol file"); }
 }
@@ -214,7 +316,7 @@ static void t_replay_large(void) {
 int main(void) {
     int baseline = hid_baseline_main();
     strcpy(replay_test_dir, "/tmp/nxnative-replay-test-XXXXXX"); CHECK(mkdtemp(replay_test_dir) != NULL, "temporary protocol directory");
-    t_replay_parse(); t_replay_frames(); t_replay_health(); t_replay_protocol(); t_replay_threads(); t_replay_large();
+    t_replay_parse(); t_replay_frames(); t_replay_health(); t_replay_terminal(); t_replay_terminal_restore(); t_replay_protocol(); t_replay_threads(); t_replay_large();
     replay_test_stop(); free(g_replay.steps); g_replay.steps = NULL;
     CHECK(!rmdir(replay_test_dir), "remove protocol directory without leftovers");
     printf("hid + native replay: %d checks, %d failed\n", checks, fails); return baseline || fails != 0;

@@ -1,0 +1,595 @@
+'use strict';
+
+// Experimental, session-bound bridge. Loading this file installs no hooks.
+// A dryrun must finish in THIS script before a separate warp arm is accepted.
+// player_checkpoint performs its own dryrun, then restores player pose and HP.
+// This does not restore world objects, camera state, timers, or RNG.
+const BUILD_ID = 'e0f3ccfaf50065ae4ea01eb5aeb13b1a';
+const SELECTOR_OFFSET = 0x3303ca0;
+const WARP_OFFSET = 0xc6fb30;
+const PLAYER_VTABLE_OFFSET = 0x4b25e18;
+const PACKET_SIZE = 448;
+const OFF = {
+  state: 0, mode: 4, expectedTid: 8, actualTid: 12, error: 16,
+  restoreResult: 20, expectedInstance: 24, instance: 32, player: 40,
+  playerVtable: 48, guestSp: 56, callbackSp: 64, gateValue: 72,
+  gateTop: 80, gateSlot: 88, x18Before: 96, x18After: 104,
+  stackDelta: 112, returnAddress: 120, frameBefore: 128, frameAfter: 136,
+  matrix: 144, positionBefore: 192, positionAfter: 204,
+  tlsBefore: 216, tlsAfter: 224, tlrBefore: 232, tlrAfter: 240,
+  components: 248, life: 256, hpRecord: 264, maxRecord: 272, lifeVtable: 280,
+  hudFlags: 288, plusFlags: 296, hudVtable: 304, plusVtable: 312,
+  targetHealth: 320, maximum: 324, healthBefore: 328, healthAfter: 332,
+  mirrorAfter: 336, stableCount: 340, requiredFrames: 344, cancelRequested: 348,
+  firstStableFrame: 352, lastSampleFrame: 360, tolerance: 368,
+  rotationTolerance: 372, rotationAfter: 376, healthWritten: 412,
+  warpCalled: 416, warpFrame: 424,
+};
+
+const NATIVE_SOURCE = `
+#include <gum/guminterceptor.h>
+#include <stddef.h>
+
+typedef struct {
+  volatile gint state;
+  guint32 mode, expected_tid, actual_tid, error;
+  gint restore_result;
+  guint64 expected_instance, instance, player, player_vtable;
+  guint64 guest_sp, callback_sp, gate_value, gate_top, gate_slot;
+  guint64 x18_before, x18_after, stack_delta, return_address;
+  guint64 frame_before, frame_after;
+  float matrix[12], position_before[3], position_after[3];
+  guint64 tls_before, tls_after, tlr_before, tlr_after;
+  guint64 components, life, hp_record, max_record, life_vtable;
+  guint64 hud_flags, plus_flags, hud_vtable, plus_vtable;
+  guint32 target_health, maximum, health_before, health_after, mirror_after;
+  guint32 stable_count, required_frames;
+  volatile gint cancel_requested;
+  guint64 first_stable_frame, last_sample_frame;
+  float tolerance, rotation_tolerance, rotation_after[9];
+  guint32 health_written, warp_called;
+  guint64 warp_frame;
+} BridgePacket;
+typedef char packet_size_check[sizeof(BridgePacket) == 432 ? 1 : -1];
+typedef char packet_matrix_check[offsetof(BridgePacket, matrix) == 144 ? 1 : -1];
+typedef char packet_tls_check[offsetof(BridgePacket, tls_before) == 216 ? 1 : -1];
+typedef char packet_life_check[offsetof(BridgePacket, life) == 256 ? 1 : -1];
+typedef char packet_warp_frame_check[offsetof(BridgePacket, warp_frame) == 424 ? 1 : -1];
+extern BridgePacket packet;
+extern gsize g_key18, g_keygate, g_keytls, g_keytlr;
+extern guint8 dm_gate_stubs[];
+extern guint64 dm_gate_top[];
+extern guint64 frame_now(void);
+extern gpointer pthread_getspecific(gsize key);
+extern gint pthread_setspecific(gsize key, gconstpointer value);
+extern unsigned char native_cas(gint old_value, gint new_value,
+                               volatile gint *address);
+extern void warp_guest(gpointer actor, const float *matrix, guint32 flags);
+extern guint32 task_self_port;
+extern gint region_info(guint32 task, guint64 *address, guint64 *size,
+                        gint flavor, gint *info, guint32 *count, guint32 *object);
+extern gint port_deallocate(guint32 task, guint32 object);
+
+// States: 1 armed, 2 claimed/awaiting original Main return, 3 finished,
+// 4 cancelled, 5 awaiting another read-only validation frame.
+gint cancel_pending(void) {
+  native_cas(0, 1, &packet.cancel_requested);
+  native_cas(1, 4, &packet.state);
+  native_cas(5, 4, &packet.state);
+  return packet.state;
+}
+gint read_state(void) {
+  gint state = packet.state;
+  native_cas(state, state, &packet.state);
+  return packet.state;
+}
+static void copy_position(float *out) {
+  const float *position = (const float *)(gsize)(packet.player + 0x31c);
+  guint i;
+  for (i = 0; i != 3; ++i) out[i] = position[i];
+}
+static guint checkpoint_identity(void) {
+  guint hp, maximum;
+  if (*(guint64 *)(gsize)(packet.player + 0x270) != packet.components ||
+      *(guint64 *)(gsize)(packet.components + 87 * 8) != packet.life ||
+      *(guint64 *)(gsize)packet.life != packet.life_vtable ||
+      *(guint64 *)(gsize)(packet.life + 0x18) != packet.player ||
+      *(guint64 *)(gsize)(packet.life + 0x1c10) != packet.hp_record ||
+      *(guint64 *)(gsize)(packet.life + 0x1c18) != packet.max_record) return 8;
+  hp = *(volatile guint32 *)(gsize)(packet.hp_record + 8);
+  maximum = *(volatile guint32 *)(gsize)(packet.max_record + 8);
+  if (!hp || hp > maximum || maximum != packet.maximum ||
+      *(guint32 *)(gsize)(packet.life + 0x1cac) != maximum) return 8;
+  if (*(guint64 *)(gsize)(packet.hud_flags - 0x1a4) != packet.hud_vtable ||
+      *(guint64 *)(gsize)(packet.plus_flags - 0x1a4) != packet.plus_vtable ||
+      !(*(guint32 *)(gsize)packet.hud_flags & 0x20000) ||
+      (*(guint32 *)(gsize)packet.plus_flags & 0x20000)) return 10;
+  return 0;
+}
+static guint writable_health(guint64 address) {
+  guint64 region = address, size = 0;
+  gint info[16], result;
+  guint32 count = 16, object = 0;
+  result = region_info(task_self_port, &region, &size, 9, info, &count, &object);
+  if (object) port_deallocate(task_self_port, object);
+  return result == 0 && count > 0 && (info[0] & 3) == 3 &&
+      !(address & 3) && address >= region && size >= 4 && address - region <= size - 4;
+}
+static guint checkpoint_readback(void) {
+  guint i, stable = 1;
+  float distance_squared = 0;
+  const float *rotation = (const float *)(gsize)(packet.player + 0x328);
+  packet.error = checkpoint_identity();
+  if (packet.error) return 0;
+  copy_position(packet.position_after);
+  packet.health_after = *(volatile guint32 *)(gsize)(packet.hp_record + 8);
+  packet.mirror_after = *(volatile guint32 *)(gsize)(packet.life + 0x1ca8);
+  if (packet.health_after != packet.target_health ||
+      packet.mirror_after != packet.target_health) stable = 0;
+  for (i = 0; i != 3; ++i) {
+    float delta = packet.position_after[i] - packet.matrix[i * 4 + 3];
+    distance_squared += delta * delta;
+  }
+  if (distance_squared != distance_squared || distance_squared > packet.tolerance * packet.tolerance) stable = 0;
+  for (i = 0; i != 9; ++i) {
+    float delta;
+    packet.rotation_after[i] = rotation[i];
+    delta = rotation[i] - packet.matrix[(i / 3) * 4 + i % 3];
+    if (delta != delta || delta > packet.rotation_tolerance || delta < -packet.rotation_tolerance) stable = 0;
+  }
+  return stable;
+}
+void on_enter(GumInvocationContext *ic) {
+  guint *claimed = (guint *)gum_invocation_context_get_listener_invocation_data(
+      ic, sizeof(guint));
+  guint tid = gum_invocation_context_get_thread_id(ic);
+  guint64 instance = (guint64)(gsize)
+      gum_invocation_context_get_nth_argument(ic, 0);
+  volatile guint64 local_marker = 0;
+  guint64 gate_delta, gate_bottom;
+  gpointer saved_x18;
+  *claimed = 0;
+  if (packet.expected_tid && packet.expected_tid != tid) return;
+  if (packet.expected_instance && packet.expected_instance != instance) return;
+  if (!native_cas(1, 2, &packet.state) && !native_cas(5, 2, &packet.state)) return;
+  *claimed = 1;
+  packet.actual_tid = tid;
+  packet.instance = instance;
+  packet.guest_sp = ic->cpu_context->sp;
+  packet.callback_sp = (guint64)(gsize)&local_marker;
+  packet.return_address = (guint64)(gsize)
+      gum_invocation_context_get_return_address(ic);
+  packet.frame_before = frame_now();
+  packet.stack_delta = packet.guest_sp > packet.callback_sp
+      ? packet.guest_sp - packet.callback_sp
+      : packet.callback_sp - packet.guest_sp;
+  saved_x18 = pthread_getspecific(g_key18);
+  packet.x18_before = (guint64)(gsize)saved_x18;
+  packet.x18_after = packet.x18_before;
+  packet.tls_before = (guint64)(gsize)pthread_getspecific(g_keytls);
+  packet.tlr_before = (guint64)(gsize)pthread_getspecific(g_keytlr);
+  packet.tls_after = packet.tls_before;
+  packet.tlr_after = packet.tlr_before;
+  packet.gate_value = (guint64)(gsize)pthread_getspecific(g_keygate);
+  if (packet.gate_value < (guint64)(gsize)dm_gate_stubs) {
+    packet.error = 1; return;
+  }
+  gate_delta = packet.gate_value - (guint64)(gsize)dm_gate_stubs;
+  if (gate_delta >= 1024 * 16 || (gate_delta & 15)) {
+    packet.error = 1; return;
+  }
+  packet.gate_slot = gate_delta / 16;
+  packet.gate_top = dm_gate_top[packet.gate_slot];
+  if (packet.gate_top < (1 << 20)) { packet.error = 2; return; }
+  gate_bottom = packet.gate_top - (1 << 20);
+  if ((packet.guest_sp >= gate_bottom && packet.guest_sp < packet.gate_top) ||
+      (packet.callback_sp >= gate_bottom && packet.callback_sp < packet.gate_top)) {
+    packet.error = 3; return;
+  }
+  if (packet.stack_delta >= 65536 || (packet.guest_sp & 15)) {
+    packet.error = 4; return;
+  }
+  if (*(guint64 *)(gsize)packet.player != packet.player_vtable ||
+      *(guint64 *)(gsize)(packet.player + 0x168) != packet.player) {
+    packet.error = 5; return;
+  }
+  if (packet.life) {
+    packet.error = checkpoint_identity();
+    if (packet.error) return;
+  }
+  if (packet.mode != 3) copy_position(packet.position_before);
+  if (packet.mode == 1 || packet.mode == 2) {
+    if (packet.mode == 2) {
+      if (!writable_health(packet.hp_record + 8) || !writable_health(packet.life + 0x1ca8)) {
+        packet.error = 12; return;
+      }
+      packet.health_before = *(volatile guint32 *)(gsize)(packet.hp_record + 8);
+      if (*(volatile guint32 *)(gsize)(packet.life + 0x1ca8) != packet.health_before) {
+        packet.error = 9; return;
+      }
+    }
+    // Ordinary native ABI call from this C callback's measured stack. No JS FFI.
+    packet.warp_frame = packet.frame_before;
+    packet.warp_called = 1;
+    warp_guest((gpointer)(gsize)packet.player, packet.matrix, 0);
+    packet.x18_after = (guint64)(gsize)pthread_getspecific(g_key18);
+    packet.restore_result = pthread_setspecific(g_key18, saved_x18);
+    if (packet.restore_result || pthread_getspecific(g_key18) != saved_x18)
+      packet.error = 6;
+    packet.tls_after = (guint64)(gsize)pthread_getspecific(g_keytls);
+    packet.tlr_after = (guint64)(gsize)pthread_getspecific(g_keytlr);
+    if (packet.tls_after != packet.tls_before || packet.tlr_after != packet.tlr_before)
+      packet.error = 7;
+    if (packet.mode == 2 && !packet.error) {
+      packet.error = checkpoint_identity();
+      if (!packet.error && (!writable_health(packet.hp_record + 8) ||
+          !writable_health(packet.life + 0x1ca8))) packet.error = 12;
+      if (!packet.error &&
+          (!native_cas(packet.health_before, packet.target_health,
+             (volatile gint *)(gsize)(packet.hp_record + 8)) ||
+           !native_cas(packet.health_before, packet.target_health,
+             (volatile gint *)(gsize)(packet.life + 0x1ca8)))) packet.error = 9;
+      if (!packet.error) packet.health_written = 1;
+    }
+  }
+  copy_position(packet.position_after);
+}
+void on_leave(GumInvocationContext *ic) {
+  guint *claimed = (guint *)gum_invocation_context_get_listener_invocation_data(
+      ic, sizeof(guint));
+  if (!*claimed) return;
+  packet.frame_after = frame_now();
+  if (packet.cancel_requested) { native_cas(2, 4, &packet.state); return; }
+  if (packet.mode >= 2 && !packet.error) {
+    guint stable = checkpoint_readback();
+    if (!packet.error && packet.frame_after != packet.last_sample_frame) {
+      packet.last_sample_frame = packet.frame_after;
+      if (stable) {
+        if (!packet.stable_count) packet.first_stable_frame = packet.frame_after;
+        ++packet.stable_count;
+      } else packet.stable_count = 0;
+    }
+    if (!packet.error && (packet.stable_count < packet.required_frames ||
+        packet.frame_after - packet.first_stable_frame < packet.required_frames - 1)) {
+      packet.mode = 3;
+      native_cas(2, 5, &packet.state);
+      return;
+    }
+  }
+  native_cas(2, 3, &packet.state);
+}
+`;
+
+let active = null;
+let proof = null;
+// Compile once per owned script session. Hooks still detach after every result;
+// the idle module/packet remain resident until explicit script unload.
+let compiled = null;
+const rangeCache = [];
+let rangeQueries = 0;
+let rangeHits = 0;
+
+function hexPointer(value, name) {
+  if (typeof value !== 'string' || !/^0x[0-9a-f]+$/i.test(value))
+    throw new Error(name + ' must be a hexadecimal address');
+  const result = ptr(value);
+  if (result.isNull()) throw new Error(name + ' cannot be null');
+  return result;
+}
+function exportAddress(name) {
+  return Module.getGlobalExportByName(name);
+}
+function requireRange(address, size, protection, label) {
+  // Mach's range lookup is expensive in this guest's large mapping inventory.
+  // Cache only spans verified in this owned process session. All actual code,
+  // owner, vtable, component pointers and health values are reread on every arm;
+  // a stale unmapped span therefore throws during those reads before native use.
+  const end = address.add(size);
+  if (end.compare(address) < 0) throw new Error(label + ' range overflows');
+  if (rangeCache.some(range => range.protection.includes(protection) &&
+      address.compare(range.base) >= 0 && end.compare(range.base.add(range.size)) <= 0)) {
+    ++rangeHits;
+    return;
+  }
+  ++rangeQueries;
+  const range = Process.findRangeByAddress(address);
+  if (!range || !range.protection.includes(protection) ||
+      end.compare(range.base.add(range.size)) > 0)
+    throw new Error(label + ' has no suitable mapped range');
+  if (rangeCache.length >= 64) throw new Error('session mapping cache budget exceeded');
+  rangeCache.push(range);
+}
+function checkpointConfig(config, base, player) {
+  const binding = config.address_binding;
+  const components = player.add(0x270).readPointer();
+  requireRange(components, 88 * 8, 'r', 'components');
+  const life = components.add(87 * 8).readPointer();
+  requireRange(life, 0x1cb0, 'r', 'life component');
+  const lifeVtable = base.add(0x4b4c460);
+  if (!life.readPointer().equals(lifeVtable) || !life.add(0x18).readPointer().equals(player))
+    throw new Error('life component identity mismatch');
+  const hpRecord = life.add(0x1c10).readPointer();
+  const maxRecord = life.add(0x1c18).readPointer();
+  requireRange(hpRecord, 12, 'w', 'authoritative health record');
+  requireRange(maxRecord, 12, 'r', 'maximum health record');
+  requireRange(life.add(0x1ca8), 8, 'w', 'health mirror');
+  if (binding.health && !hexPointer(binding.health, 'health mirror').equals(life.add(0x1ca8)))
+    throw new Error('health mirror binding mismatch');
+  const maximum = maxRecord.add(8).readU32();
+  const health = hpRecord.add(8).readU32();
+  if (maximum < 1 || maximum > 80 || health < 1 || health > maximum ||
+      life.add(0x1ca8).readU32() !== health || life.add(0x1cac).readU32() !== maximum)
+    throw new Error('living authoritative health/mirror mismatch');
+  const hudFlags = hexPointer(binding.hud_flags, 'hud_flags');
+  const plusFlags = hexPointer(binding.plus_flags, 'plus_flags');
+  const hudVtable = base.add(0x4beb710);
+  const plusVtable = base.add(0x4bebaa8);
+  for (const [flags, vtable] of [[hudFlags, hudVtable], [plusFlags, plusVtable]]) {
+    requireRange(flags.sub(0x1a4), 0x1a8, 'r', 'UI object');
+    if (!flags.sub(0x1a4).readPointer().equals(vtable)) throw new Error('UI identity mismatch');
+  }
+  if (!(hudFlags.readU32() & 0x20000) || (plusFlags.readU32() & 0x20000))
+    throw new Error('player checkpoint requires gameplay');
+  const targetHealth = config.start_health;
+  const start = config.start;
+  const rotation = config.target_rotation;
+  if (!Number.isInteger(targetHealth) || targetHealth < 1 || targetHealth > maximum)
+    throw new Error('start_health is outside current maximum');
+  if (!Array.isArray(start) || start.length !== 3 ||
+      !start.every(value => Number.isFinite(value) && Math.abs(value) < 1e6))
+    throw new Error('finite three-coordinate start required');
+  if (!Array.isArray(rotation) || rotation.length !== 9 ||
+      !rotation.every(value => Number.isFinite(value) && Math.abs(value) <= 1.01))
+    throw new Error('target_rotation requires a finite orthonormal 3x3 matrix');
+  for (let i = 0; i < 3; ++i) {
+    for (let j = i; j < 3; ++j) {
+      const dot = [0, 1, 2].reduce((sum, k) => sum + rotation[i * 3 + k] * rotation[j * 3 + k], 0);
+      if (Math.abs(dot - (i === j ? 1 : 0)) > 0.01) throw new Error('target_rotation is not orthonormal');
+    }
+  }
+  const determinant = rotation[0] * (rotation[4] * rotation[8] - rotation[5] * rotation[7]) -
+    rotation[1] * (rotation[3] * rotation[8] - rotation[5] * rotation[6]) +
+    rotation[2] * (rotation[3] * rotation[7] - rotation[4] * rotation[6]);
+  if (Math.abs(determinant - 1) > 0.01) throw new Error('target_rotation must preserve orientation');
+  const tolerance = config.start_tolerance === undefined ? 0.3 : config.start_tolerance;
+  const rotationTolerance = config.rotation_tolerance === undefined ? 0.02 : config.rotation_tolerance;
+  const requiredFrames = config.stable_frames === undefined ? 3 : config.stable_frames;
+  if (!Number.isFinite(tolerance) || tolerance < 0.001 || tolerance > 1 ||
+      !Number.isFinite(rotationTolerance) || rotationTolerance < 0.001 || rotationTolerance > 0.1 ||
+      !Number.isInteger(requiredFrames) || requiredFrames < 2 || requiredFrames > 30)
+    throw new Error('invalid checkpoint stability bounds');
+  const matrix = rotation.flatMap((_, i) => i % 3 === 0
+    ? [rotation[i], rotation[i + 1], rotation[i + 2], start[i / 3]] : []);
+  return { components, life, hpRecord, maxRecord, lifeVtable, hudFlags, plusFlags,
+    hudVtable, plusVtable, maximum, targetHealth, matrix, tolerance, rotationTolerance, requiredFrames };
+}
+function validate(config, nonce) {
+  if (!config || typeof config !== 'object' || typeof nonce !== 'string' || !nonce)
+    throw new Error('config and nonempty nonce required');
+  if (Process.arch !== 'arm64' || Process.platform !== 'darwin' || Process.pointerSize !== 8)
+    throw new Error('this prototype requires Darwin arm64');
+  if (config.pid !== Process.id || config.build_id !== BUILD_ID)
+    throw new Error('PID/build identity mismatch');
+  const base = hexPointer(config.mainbase, 'mainbase');
+  const binding = config.address_binding || {};
+  const player = hexPointer(binding.player, 'address_binding.player');
+  const fingerprints = binding.code_fingerprints;
+  if (!fingerprints || typeof fingerprints !== 'object')
+    throw new Error('code_fingerprints required');
+  for (const offset of [SELECTOR_OFFSET, WARP_OFFSET]) {
+    const key = '0x' + offset.toString(16);
+    const expected = fingerprints[key];
+    if (typeof expected !== 'string' || !/^(?:[0-9a-f]{2}){16,64}$/i.test(expected))
+      throw new Error('16-64 exact patched code bytes required for ' + key);
+    const address = base.add(offset);
+    requireRange(address, expected.length / 2, 'x', key);
+    const actual = Array.from(new Uint8Array(address.readByteArray(expected.length / 2)))
+      .map(value => value.toString(16).padStart(2, '0')).join('');
+    if (actual !== expected.toLowerCase()) throw new Error('code mismatch at ' + key);
+  }
+  requireRange(player, 0x34c, 'r', 'player');
+  const expectedVtable = base.add(PLAYER_VTABLE_OFFSET);
+  if (!player.readPointer().equals(expectedVtable) ||
+      !player.add(0x168).readPointer().equals(player))
+    throw new Error('player identity mismatch');
+  const mode = config.mode || 'dryrun';
+  if (!['dryrun', 'warp', 'player_checkpoint'].includes(mode)) throw new Error('unknown mode');
+  const timeout = config.timeout_seconds === undefined ? 10 : config.timeout_seconds;
+  if (!Number.isFinite(timeout) || timeout < 0.1 || timeout > 60)
+    throw new Error('timeout_seconds must be between 0.1 and 60');
+  const identity = [Process.id, BUILD_ID, base.toString(), player.toString(),
+    fingerprints['0x3303ca0'].toLowerCase(), fingerprints['0xc6fb30'].toLowerCase()].join(':');
+  if (mode === 'warp') {
+    if (config.confirm_warp !== true || !proof || proof.identity !== identity ||
+        config.dryrun_nonce !== proof.nonce)
+      throw new Error('warp requires confirm_warp and matching completed dryrun_nonce');
+    if (!Array.isArray(config.target_matrix) || config.target_matrix.length !== 12 ||
+        !config.target_matrix.every(value => Number.isFinite(value) && Math.abs(value) < 1e7))
+      throw new Error('finite row-major Matrix34 target_matrix required');
+  }
+  const checkpoint = mode === 'player_checkpoint' ? checkpointConfig(config, base, player) : null;
+  return { base, player, expectedVtable, mode, timeout, identity, checkpoint };
+}
+function metrics(run) {
+  const p = run.packet;
+  const address = offset => p.add(offset).readPointer().toString();
+  const vector = offset => [0, 1, 2].map(i => p.add(offset + i * 4).readFloat());
+  return {
+    mode: run.mode, pid: Process.id, mainbase: run.base.toString(),
+    player: run.player.toString(), thread_id: p.add(OFF.actualTid).readU32(),
+    main_instance: address(OFF.instance), guest_sp: address(OFF.guestSp),
+    callback_local: address(OFF.callbackSp), stack_delta: p.add(OFF.stackDelta).readU64().toString(),
+    gate_value: address(OFF.gateValue), gate_top: address(OFF.gateTop),
+    gate_slot: p.add(OFF.gateSlot).readU64().toString(),
+    virtual_x18_before: address(OFF.x18Before), virtual_x18_after_call: address(OFF.x18After),
+    virtual_x18_restore_result: p.add(OFF.restoreResult).readS32(),
+    tls_before: address(OFF.tlsBefore), tls_after_call: address(OFF.tlsAfter),
+    tlr_before: address(OFF.tlrBefore), tlr_after_call: address(OFF.tlrAfter),
+    return_address: address(OFF.returnAddress),
+    frame_before: p.add(OFF.frameBefore).readU64().toString(),
+    frame_after: p.add(OFF.frameAfter).readU64().toString(),
+    frame_available: true,
+    position_before: vector(OFF.positionBefore), position_after: vector(OFF.positionAfter),
+    error_code: p.add(OFF.error).readU32(),
+    semantics: run.mode === 'player_checkpoint' ? 'player_checkpoint' : run.mode,
+    authoritative_health: p.add(OFF.healthAfter).readU32(),
+    mirror_health: p.add(OFF.mirrorAfter).readU32(),
+    health_before: p.add(OFF.healthBefore).readU32(),
+    health_written: p.add(OFF.healthWritten).readU32() === 1,
+    warp_called: p.add(OFF.warpCalled).readU32() === 1,
+    warp_frame: p.add(OFF.warpFrame).readU64().toString(),
+    stable_frames: p.add(OFF.stableCount).readU32(),
+    first_stable_frame: p.add(OFF.firstStableFrame).readU64().toString(),
+    last_stable_frame: p.add(OFF.lastSampleFrame).readU64().toString(),
+    rotation_after: Array.from({ length: 9 }, (_, i) => p.add(OFF.rotationAfter + i * 4).readFloat()),
+    arm_timings: run.armTimings,
+  };
+}
+function detach(run) {
+  if (run.listener) { run.listener.detach(); run.listener = null; }
+  Interceptor.flush();
+  if (run.timer) { clearInterval(run.timer); run.timer = null; }
+  run.inactive = true;
+}
+function finish(run) {
+  if (active !== run || run.inactive) return;
+  const state = run.readState();
+  if (state !== 3 && state !== 4) return;
+  const evidence = metrics(run);
+  const failed = state === 4 || evidence.error_code !== 0 || run.timedOut || run.cancelled;
+  if (!failed && run.mode === 'player_checkpoint' && run.nativePhase === 'dryrun') {
+    run.dryrunEvidence = evidence;
+    run.nativePhase = 'restore';
+    run.packet.add(OFF.expectedInstance).writePointer(ptr(evidence.main_instance));
+    run.packet.add(OFF.mode).writeU32(2);
+    run.packet.add(OFF.state).writeS32(1);
+    send({ event: 'phase', nonce: run.nonce, phase: 'dryrun_verified', evidence });
+    return;
+  }
+  detach(run);
+  if (!failed && run.mode === 'dryrun') {
+    proof = { identity: run.identity, nonce: run.nonce,
+      threadId: evidence.thread_id, instance: evidence.main_instance };
+  }
+  if (failed) proof = null;
+  if (run.dryrunEvidence) evidence.dryrun = run.dryrunEvidence;
+  run.result = { event: failed ? 'failed' : (run.mode === 'player_checkpoint' ? 'restored' :
+      (run.mode === 'dryrun' ? 'dryrun' : 'warped')),
+    terminal: true, nonce: run.nonce, descriptor_restored: true,
+    semantics: run.mode === 'player_checkpoint' ? 'player_checkpoint' : run.mode,
+    error: failed ? 'native checkpoint failed (code ' + evidence.error_code + ')' : undefined,
+    reason: run.timedOut ? 'timeout; native callback was allowed to finish' :
+      (state === 4 ? 'cancelled before native claim' : undefined), evidence };
+  send(run.result);
+}
+
+rpc.exports = {
+  arm(config, nonce) {
+    if (active && !active.inactive) throw new Error('previous arm remains active');
+    const began = Date.now();
+    const queriesBefore = rangeQueries, hitsBefore = rangeHits;
+    const checked = validate(config, nonce);
+    const validated = Date.now();
+    if (compiled && compiled.identity !== checked.identity)
+      throw new Error('resident bridge identity changed; unload before rebinding');
+    const reused = compiled !== null;
+    const packet = compiled ? compiled.packet : Memory.alloc(PACKET_SIZE);
+    packet.writeByteArray(new Uint8Array(PACKET_SIZE));
+    packet.add(OFF.mode).writeU32(checked.mode === 'warp' ? 1 : 0);
+    packet.add(OFF.player).writePointer(checked.player);
+    packet.add(OFF.playerVtable).writePointer(checked.expectedVtable);
+    if (checked.checkpoint) {
+      const cp = checked.checkpoint;
+      for (const name of ['components', 'life', 'hpRecord', 'maxRecord', 'lifeVtable',
+        'hudFlags', 'plusFlags', 'hudVtable', 'plusVtable']) packet.add(OFF[name]).writePointer(cp[name]);
+      for (const name of ['targetHealth', 'maximum', 'requiredFrames']) packet.add(OFF[name]).writeU32(cp[name]);
+      packet.add(OFF.tolerance).writeFloat(cp.tolerance);
+      packet.add(OFF.rotationTolerance).writeFloat(cp.rotationTolerance);
+      cp.matrix.forEach((value, i) => packet.add(OFF.matrix + i * 4).writeFloat(value));
+    }
+    if (checked.mode === 'warp') {
+      // Main may rotate worker threads. Every claimed invocation repeats the
+      // stack/gate checks using that invocation's own pthread TSD and gate slot.
+      packet.add(OFF.expectedInstance).writePointer(ptr(proof.instance));
+      config.target_matrix.forEach((value, i) => packet.add(OFF.matrix + i * 4).writeFloat(value));
+      proof = null; // A successful proof authorizes only this single warp arm.
+    } else {
+      proof = null;
+    }
+    const compileBegan = Date.now();
+    const module = compiled ? compiled.module : new CModule(NATIVE_SOURCE, {
+      packet,
+      g_key18: exportAddress('g_key18'), g_keygate: exportAddress('g_keygate'),
+      g_keytls: exportAddress('g_keytls'), g_keytlr: exportAddress('g_keytlr'),
+      dm_gate_stubs: exportAddress('dm_gate_stubs'), dm_gate_top: exportAddress('dm_gate_top'),
+      frame_now: exportAddress('dm_guest_frame'),
+      pthread_getspecific: exportAddress('pthread_getspecific'),
+      pthread_setspecific: exportAddress('pthread_setspecific'),
+      native_cas: exportAddress('OSAtomicCompareAndSwap32Barrier'),
+      warp_guest: checked.base.add(WARP_OFFSET),
+      task_self_port: exportAddress('mach_task_self_'),
+      region_info: exportAddress('mach_vm_region'),
+      port_deallocate: exportAddress('mach_port_deallocate'),
+    });
+    const compileEnded = Date.now();
+    if (!compiled) compiled = { identity: checked.identity, packet, module,
+      readState: new NativeFunction(module.read_state, 'int', []),
+      cancelPending: new NativeFunction(module.cancel_pending, 'int', []) };
+    const run = { ...checked, packet, module, nonce,
+      timer: null, listener: null,
+      inactive: false, timedOut: false, cancelled: false, result: null,
+      nativePhase: checked.mode === 'player_checkpoint' ? 'dryrun' : checked.mode,
+      readState: compiled.readState, cancelPending: compiled.cancelPending,
+      armTimings: { reused_module: reused, validation_ms: validated - began,
+        compile_ms: compileEnded - compileBegan, range_queries: rangeQueries - queriesBefore,
+        range_cache_hits: rangeHits - hitsBefore, range_cache_entries: rangeCache.length },
+    };
+    active = run;
+    try {
+      // Armed only after listener installation succeeds. No guest call from JS.
+      const attachBegan = Date.now();
+      run.listener = Interceptor.attach(checked.base.add(SELECTOR_OFFSET), {
+        onEnter: module.on_enter, onLeave: module.on_leave,
+      });
+      const attached = Date.now();
+      Interceptor.flush();
+      const flushed = Date.now();
+      run.armTimings.attach_ms = attached - attachBegan;
+      run.armTimings.flush_ms = flushed - attached;
+      run.armTimings.total_ms = flushed - began;
+      packet.add(OFF.state).writeS32(1);
+      const deadline = Date.now() + checked.timeout * 1000;
+      run.timer = setInterval(() => {
+        if (!run.inactive && Date.now() >= deadline && !run.timedOut) {
+          run.timedOut = true;
+          run.cancelPending();
+          send({ event: 'phase', nonce, phase: 'timeout_pending_cleanup',
+            descriptor_restored: false });
+        }
+        finish(run);
+      }, 10);
+      send({ event: 'phase', nonce, phase: 'armed', mode: checked.mode, timings: run.armTimings });
+      return { armed: true, nonce, mode: checked.mode, timings: run.armTimings };
+    } catch (error) {
+      // Installation failures occur before publication of the armed packet.
+      run.cancelPending();
+      if (run.readState() !== 2) detach(run);
+      throw error;
+    }
+  },
+  status() {
+    if (!active) return { active: false, descriptor_restored: true };
+    finish(active);
+    return { active: !active.inactive, nonce: active.nonce,
+      state: active.readState(), descriptor_restored: active.inactive,
+      result: active.result };
+  },
+  cancel() {
+    if (!active) return { descriptor_restored: true, active: false };
+    active.cancelled = true;
+    active.cancelPending();
+    finish(active);
+    return { descriptor_restored: active.inactive, active: !active.inactive,
+      nonce: active.nonce, state: active.readState() };
+  },
+};
