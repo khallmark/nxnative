@@ -11,7 +11,7 @@ import traceback
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'dm'/'tools'))
 from evolution.core import Evolution
 from evolution.episodes import NativeEpisodes,NativeUIInterruption,validate_episode
-from evolution.handoff import assert_no_pending_handoff,wait_for_handoff
+from evolution.handoff import assert_no_pending_handoff,wait_for_handoff,prepare_objective_handoff
 from evolution.live import TrialStopped,ui_matches
 from evolution.replay import ReplayBridge
 from evolution.reset import FridaReset,prepare_fast_reset
@@ -31,9 +31,12 @@ def main():
     ap.add_argument('--initial-sigma',type=float,default=.35,help='Initial population mutation spread; independent of later mutation sigma')
     ap.add_argument('--seed-champion',type=Path)
     ap.add_argument('--resident-handoff',action='store_true',help='Keep the same attachment resident for explicitly guarded UI commands')
+    ap.add_argument('--progression-handoff',action='store_true',help='Hold after one candidate qualifies on every task and repeat')
     args=ap.parse_args()
     if args.generations<0:ap.error('generations must be nonnegative')
     config=json.loads(args.session.read_text());spec=json.loads(args.objective.read_text());validate_episode(spec)
+    if args.progression_handoff and (not args.resident_handoff or spec.get('stop_on_objective') is not True):
+        ap.error('--progression-handoff requires --resident-handoff and stop_on_objective=true')
     if not config.get('recovery',{}).get('death_steps'):ap.error('Session must include calibrated death_steps')
     # This open-loop GA needs player/health/UI observations, not actor rediscovery.
     config.pop('actor_discovery',None)
@@ -42,7 +45,7 @@ def main():
     config['checkpoint_state']=str((args.output/'checkpoint-state.json').resolve())
     prepared=prepare_fast_reset(config)
     package=Path(__file__).resolve().parents[1]/'dm'/'tools'/'evolution'
-    implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py','reset.py','handoff.py'))])+json.dumps(config,sort_keys=True).encode()+(prepared.fingerprint() if prepared else b'')).hexdigest()
+    implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py','reset.py','handoff.py'))])+json.dumps(dict(session=config,progression_handoff=args.progression_handoff),sort_keys=True).encode()+(prepared.fingerprint() if prepared else b'')).hexdigest()
     policy=spec.get('policy','timeline_v1')
     initial=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else seed_genome(spec.get('segments',128),spec.get('initial_direction',[0,1]),policy)
     evolution=Evolution(args.output/'evolution.sqlite',[spec],args.population,args.repeats,implementation=implementation,
@@ -79,8 +82,19 @@ def main():
                 break
             attempts+=1;result['reset_seconds']=reset_seconds
             result['attempts_per_minute']=attempts*60/max(time.perf_counter()-run_start,1e-9)
+            intent=None
+            if args.progression_handoff:
+                # Even partial marker publication forbids cleanup menu input.
+                was_running=bridge.running;bridge.running=False
+                intent=prepare_objective_handoff(evolution,key,result,args.output,config,
+                    genome=genome,implementation=implementation)
+                if intent is None:bridge.running=was_running
             evolution.record(key,result)
             print(json.dumps(dict(event='episode_finished',key=key,**result)),flush=True)
+            if intent is not None:
+                wait_for_handoff(bridge,backend,args.output,key=key,genome=genome,objective=spec,
+                    implementation=implementation,log=log,resident=True,intent=intent,evolution=evolution)
+                break
             _,reset_seconds=env.restore()
     except BaseException as exc:
         primary=exc

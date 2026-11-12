@@ -350,6 +350,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** episode tests cover default survival, early objective termination, terminal/cancellation races, invalid acknowledgements and cleanup failures. Score tests distinguish faster successful navigation from longer survival. See [whole-attempt evolution](../evolution.md#native-whole-attempt-evolution).
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), during forest target-feedback qualification.
 
+### A qualified navigation policy resets the reached milestone
+
+- **Symptom:** the trainer repeatedly solves a waypoint and returns to its old checkpoint instead of retaining the reached state for further play.
+- **Cause:** the native runner unconditionally restores after every recorded result. A single successful row also does not establish a qualified candidate because the scheduler interleaves candidates across repeats.
+- **Fix:** optional progression handoff requires objective termination and a complete successful task/repeat set for one exact generation/candidate. Publish a control-scoped preparing intent before committing the final qualifying trial, archive its supporting rows and verified terminal evidence, and hold the same owner before any restore. Bounded observation, ordinary button input and button-free world movement allow supervised progression. No new checkpoint adoption or automatic resume is implied. Partial intents block startup even with a different output directory.
+- **Check:** runner and handoff tests cover interleaved qualification, durable pre-record barriers, incomplete publication, scored objective versus unscored UI evidence, unchanged default resets, stale commands, movement interruption and cancellation failures. See [progression after a qualified objective](../evolution.md#progression-after-a-qualified-objective).
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), after repeated forest waypoint qualification.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

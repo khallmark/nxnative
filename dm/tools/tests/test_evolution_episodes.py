@@ -265,6 +265,8 @@ class EpisodeTests(unittest.TestCase):
         self.assertEqual(b.cancelled,1);self.assertEqual(result['reason'],'objective')
         self.assertTrue(result['success']);self.assertFalse(result['censored'])
         self.assertEqual(result['objective_frame'],25);self.assertEqual(result['alive_frames'],27)
+        self.assertEqual(result['terminal_status'],b.stopped)
+        self.assertIsNot(result['terminal_status'],b.stopped)
         self.assertEqual(result['score'],100*101+75)
         self.assertIsInstance(result['objective_elapsed'],float)
         confirmed=[json.loads(line)for line in log.getvalue().splitlines()if json.loads(line)['event']=='objective_confirmed']

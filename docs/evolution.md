@@ -143,6 +143,8 @@ A supervising controller reads `handoff-ack.json` and atomically replaces
 
 | Action | Additional fields | Behavior |
 | --- | --- | --- |
+| `observe` | None | Reads fresh state and native status without input. |
+| `move` | `expected_epoch`, `expected_ui: "gameplay"`, nonempty `expected_reads`, `world_xz`, `frames`, `bounds`, `timeout_seconds` | Runs one guarded, button-free world movement segment, then verifies cancellation before returning to the hold. |
 | `input` | `expected_epoch`, nonempty `expected_reads`, `keys`, `hold_seconds`; optional `expected_ui` | Revalidates identities, living health and idle ownership, then sends one guarded ordinary button or neutral hold of 0.05–0.5 seconds through the same bridge. |
 | `shutdown` | None | Requests actual cleanup and process exit; it does not acknowledge successful unload or resolve the milestone. |
 
@@ -166,6 +168,49 @@ the old experiment. A fresh host/control session and validated checkpoint belong
 to a new experiment. This mechanism prevents UI from initiating teardown;
 it cannot make an already timed-out remote unload safe to reuse. See the
 [UI lifecycle finding](reference/services.md#item-dialogue-interrupts-a-native-training-episode).
+
+### Progression after a qualified objective
+
+Add `--progression-handoff --resident-handoff` when the objective has
+`stop_on_objective: true`. The runner evaluates interleaved repeats normally.
+It enters a resident progression hold only when one exact generation/candidate
+has successful `reason: objective` results for every configured task and repeat.
+This qualifies that candidate; it does not select a champion or complete the
+other candidates' pending trials. The progression mode participates in experiment
+identity; changing it requires a fresh database.
+
+The control-scoped preparing marker is made durable before the final qualifying
+trial is committed. The archive retains every supporting trial, the genome,
+objective, experiment identity and actual terminal evidence. The final result is
+scored exactly once, then the same owner enters the hold before any checkpoint
+restore. Partial intent or publication failures remain startup barriers, including
+when a different output directory is requested. An objective hold is explicitly
+scored; living UI interruptions retain their unscored meaning.
+
+The supervisor can inspect fresh state or request one bounded, button-free world
+movement segment through the resident owner. Movement uses the existing frozen
+world binding and health guard, requires current gameplay and exact observed
+state guards, and is limited by frames, a wall deadline and observed position
+bounds. `world_xz` is a finite two-number vector inside the unit disc; `frames`
+is an integer from 1 to 30. `bounds` contains three ordered `[minimum, maximum]`
+pairs for X, Y and Z, and must contain the current position. `timeout_seconds`
+is 0.1–5 seconds for movement RPCs; cancellation has a separate two-second
+budget even if that operation deadline expires. The existing authoritative
+health guard stops native input at death. Position and UI bounds are checked on
+observations, not by a new per-frame terrain controller.
+
+Input is cancelled and its terminal identity verified on every dispatch path,
+including a lost start acknowledgement. UI, damage, bounds or a stalled frame
+counter stops movement and retains the hold after verified cancellation. Invalid
+identity, uncertain cancellation or other runtime failures stop the owner.
+Movement never triggers a reset or assigns fitness. Single-button `input`
+commands remain separate. All commands retain nonce/sequence protection.
+
+This phase preserves a qualified result and permits supervised game progression.
+It does not adopt new save hashes, rebind actors, resume training, or reset to a
+new checkpoint. New checkpoints and scene bindings still require separate
+validation and a fresh experiment. The hold requires a healthy idle backend;
+it cannot be entered through a failed reset or uncertain instrumentation unload.
 
 ### In-place player checkpoints
 

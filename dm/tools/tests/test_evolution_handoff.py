@@ -114,6 +114,13 @@ class HandoffTests(unittest.TestCase):
     def test_nonresident_mode_archives_and_retains_restart_barrier(self):
         with self.assertRaisesRegex(TrialStopped,'resident-handoff'):self.run_hold(resident=False)
         with self.assertRaises(TrialStopped):assert_no_pending_handoff(self.output)
+    def test_observe_is_read_only_and_consumes_nonce_sequence(self):
+        self.run_hold([dict(sequence=1,action='observe'),dict(sequence=1,action='observe',duplicate=True),
+                       dict(sequence=2,action='shutdown')])
+        _,rows=self.records()
+        self.assertEqual(len([r for r in rows if r['phase']=='observed']),1)
+        self.assertEqual(self.bridge.inputs,[]);self.assertEqual(self.bridge.cancelled,0)
+
     def test_foreign_epoch_before_handoff_is_not_accepted(self):
         self.bridge.epoch=8
         with self.assertRaisesRegex(TrialStopped,'epoch changed'):self.run_hold()

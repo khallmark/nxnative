@@ -213,4 +213,4 @@ class NativeEpisodes:
         return dict(scorer.finish(terminal,stop_on_objective=s.get('stop_on_objective',False)),elapsed=elapsed,compile_seconds=compile_seconds,
                     frames_per_wall_second=scorer.last_frame/max(elapsed,1e-9),
                     observation_max_frame_skew=max_skew,native_epoch=status['epoch'],
-                    objective_elapsed=objective_elapsed)
+                    objective_elapsed=objective_elapsed,terminal_status=dict(cancelled))

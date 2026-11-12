@@ -118,6 +118,33 @@ class ReplayTests(unittest.TestCase):
             b.close();cancel.assert_not_called()
             b.owns_replay=True;b.close();cancel.assert_called_once()
 
+    def test_scoped_deadline_expires_before_dispatch_and_restores_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            b=self.bridge(td);b.owns_replay=False;sent=[];b.send=lambda *lines:sent.extend(lines)
+            with b.request_deadline(.1):
+                deadline=b.rpc_deadline;assert deadline is not None
+                with patch('evolution.replay.time.monotonic',return_value=deadline+1):
+                    with self.assertRaisesRegex(TrialStopped,'deadline'):b.rpc('replay')
+            self.assertEqual(sent,[]);self.assertFalse(b.owns_replay);self.assertIsNone(b.rpc_deadline)
+            self.assertEqual(list(Path(td).iterdir()),[])
+            for timeout in [True,0,-1,11,float('nan')]:
+                with self.subTest(timeout=timeout),self.assertRaises(ValueError),b.request_deadline(timeout):pass
+
+    def test_lost_ack_uses_operation_budget_and_cleanup_gets_new_budget(self):
+        import json
+        with tempfile.TemporaryDirectory() as td:
+            b=self.bridge(td);b.send=lambda *lines:None
+            with patch('evolution.replay.time.monotonic',side_effect=[0.,0.,0.,.2]):
+                with b.request_deadline(.1),self.assertRaisesRegex(TrialStopped,'ACK timed out'):b.rpc('replay')
+            self.assertTrue(b.owns_replay);self.assertIsNone(b.rpc_deadline)
+            self.assertEqual(list(Path(td).iterdir()),[])
+            def send(*lines):
+                Path(lines[0].split()[-1]).write_text(json.dumps(dict(protocol=1,ok=True,epoch=1,
+                    current_frame=10,start_frame=10,end_frame=20,active=False)))
+            b.send=send
+            with b.request_deadline(2.):self.assertFalse(b.cancel_replay()['active'])
+            self.assertFalse(b.owns_replay);self.assertIsNone(b.rpc_deadline)
+
     def test_rpc_rejects_other_epoch_and_accepts_atomic_ack(self):
         import json
         with tempfile.TemporaryDirectory() as td:

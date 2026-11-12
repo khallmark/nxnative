@@ -95,8 +95,10 @@ Current, Mac only, NSO build `e0f3ccfaf50065ae4ea01eb5aeb13b1a`: the optional
 pose and health while the scene remains loaded. Its generic runner contract is in
 [the evolution guide](../../../docs/evolution.md#in-place-player-checkpoints).
 The native player/controller warp is `main+0xc6fb30`, called with a row-major
-Matrix34 and mode 0 from the game-stack callback at `main+0x3303ca0`. The bridge
-checks the native stack and host-gate bounds and restores virtual x18; direct
+Matrix34 and mode 0. The default path uses the game-stack callback at
+`main+0x3303ca0`; with `reset_action: true`, both Wait and the later warp run in
+the actor callback at `main+0xcba80`, while Main only validates the result. The
+bridge checks the native stack and host-gate bounds and restores virtual x18; direct
 JavaScript FFI calls into guest code are not a substitute for that bridge.
 
 The authoritative health record is reached from player components at `+0x270`,
@@ -268,7 +270,30 @@ cycle. Default survival mode still runs to death or its horizon. No natural deat
 occurred in this qualification; death uses ordinary recovery while lethal hooks
 are excluded. This isolates instrumentation and does not establish a crash fix.
 
-The fourth candidate crashed with SIGBUS: PC and fault address were
+The living-only run later reached 77 successful objective completions. Its next
+reset failed the 60-frame post-warp stability deadline: the first readback
+matched the checkpoint, but the player subsequently settled about 0.107 units
+away with roughly opposite facing. Health and final motion deltas were valid;
+the required target rotation was not. All 77 successful starting resets had the
+exact target rotation, including some with larger position drift (up to 0.127
+units). The source of the later rotation change remains unresolved. The trainer exited after a cancelled bounded unload. The
+host stayed alive, all four original actor-hook sites and fourteen save hashes
+were verified, and ordinary native gameplay continued without another Frida
+attachment. The shorter successful timing samples do not prove indefinite reset
+reliability.
+Ordinary native gameplay then collected eight more rupees (16 to 24) and a
+recovery heart (health 6 to 10), reaching the shop. A new fourteen-file checkpoint
+archive was verified by normal Save/Load at `[-1.62644, 110.20952, -23.27541]`,
+health 10/12, with earlier archives preserved. The sword remains owned and the
+shield remains missing; these village gains came from supervised ordinary
+controls, not a scored genetic-policy qualification.
+
+[Progression handoff](../../../docs/evolution.md#progression-after-a-qualified-objective)
+preserves a qualified candidate at its reached waypoint before the old checkpoint
+is restored. It supplies supervised bounded movement, not automatic checkpoint
+adoption or completion of the game's remaining objectives.
+
+The earlier fully instrumented run's fourth candidate crashed with SIGBUS: PC and fault address were
 `main+0x4cbf040`, the `GetTlsValue` import slot, with LR `main+0x49dea4`
 in the health-update function containing the optional lethal hooks. Bounded
 disassembly matches the saved scratch registers to the import thunk and SDK
@@ -315,6 +340,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [A qualified navigation policy resets the reached milestone](../../../docs/reference/services.md#a-qualified-navigation-policy-resets-the-reached-milestone): a resident objective boundary preserves a fully repeated candidate and enables supervised continuation before checkpoint restoration.
 - [A successful navigation trial waits before retrying](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying): the forest trials spent about fifteen seconds after first logged target proximity before their fixed horizon; explicit objective termination separates navigation speed from survival evaluation.
 - [Timed movement overshoots when presented frames slow down](../../../docs/reference/services.md#timed-movement-overshoots-when-presented-frames-slow-down): guarded native target steering adds position feedback and braking; live terrain/deadzone qualification remains separate from the synthetic model.
 - [Item dialogue interrupts a native training episode](../../../docs/reference/services.md#item-dialogue-interrupts-a-native-training-episode): the sword acquisition exposed a lifecycle interruption distinct from warm reset latency. The opt-in `--resident-handoff` retains the winning candidate and attachment while a supervisor handles the dialogue; it does not classify unknown UI as success or resume an obsolete objective.

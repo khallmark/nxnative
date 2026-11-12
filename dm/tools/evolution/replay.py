@@ -3,6 +3,7 @@ import json
 import math
 import re
 from collections import deque
+from contextlib import contextmanager
 import time
 import uuid
 from .live import Bridge,TrialStopped
@@ -50,14 +51,27 @@ class ReplayBridge(Bridge):
         if type(self.fps) is not int or not 1<=self.fps<=240:raise ValueError('Invalid guest replay FPS')
         super().__init__(config)
 
+    @contextmanager
+    def request_deadline(self,seconds):
+        """Bound all RPCs in one operation; callers budget cleanup separately."""
+        if type(seconds) not in (int,float) or not math.isfinite(seconds) or not 0<seconds<=10:
+            raise ValueError('Invalid native request deadline')
+        previous=getattr(self,'rpc_deadline',None)
+        deadline=time.monotonic()+seconds
+        self.rpc_deadline=min(previous,deadline) if previous is not None else deadline
+        try:yield
+        finally:self.rpc_deadline=previous
+
     def rpc(self,verb,before=(),after=()):
         ack=self.root/(uuid.uuid4().hex+'.json')
         parts=(verb,*map(str,before),str(ack),*map(str,after))
         if any(any(c.isspace() for c in part) for part in parts):raise ValueError('Whitespace in replay argument')
+        deadline=min(time.monotonic()+10,getattr(self,'rpc_deadline',None) or float('inf'))
         try:
+            if time.monotonic()>=deadline:raise TrialStopped('Native replay request deadline expired')
             # Once a start is dispatched, a missing ACK leaves input ownership uncertain.
             if verb=='replay':self.owns_replay=True
-            self.send(' '.join(parts));deadline=time.monotonic()+10
+            self.send(' '.join(parts))
             while not ack.is_file():
                 if time.monotonic()>deadline:raise TrialStopped('Native replay ACK timed out')
                 time.sleep(.001)
