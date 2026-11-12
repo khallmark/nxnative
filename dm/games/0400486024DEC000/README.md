@@ -139,12 +139,21 @@ checks acceptance and the selected action, then warps. Bind fresh `action_bsa`,
 `action_bsa_vtable` and `action_slot0` addresses and both extra code fingerprints.
 The callback verifies actor/BSA registers, ownership, the native stack and thread
 context. Main performs the subsequent stability reads. The default leaves this
-experimental action request disabled; live post-lethal acceptance remains open.
+experimental action request disabled. A controlled lethal pilot on a fresh host
+passed: after a recorded artificial health change from 10 to 1, a real boulder
+hit produced terminal health 0 at frame 9137. The action request and warp ran at
+9140, then frames 9141–9143 verified the checkpoint and health 10. Python measured
+104.55 ms from reset request to verification, with no menu input. This probe has
+no fitness database and is not full-health survival evidence. The continuous trainer then completed two ordinary 7,200-frame attempts, each
+ending with health 1, and automatically restored checkpoint health 10 in 107.69
+and 114.89 ms. The first terminal-to-next-start gap was eight guest frames.
+A natural lethal cycle starting at the normal checkpoint health remains under
+observation; the diagnostic injury is not mixed into its fitness.
 
 This player checkpoint keeps camera, hazards, animation, random state, inventory
 and quest progress running. Session addresses need fresh discovery after a process
 restart. Original save archives remain separate and unchanged. Continuous instant
-death recovery remains under investigation. No successful chest landing, sword,
+death recovery is being checked in ordinary training attempts. No successful chest landing, sword,
 boss or ending has been established by this training run.
 
 ## Open
