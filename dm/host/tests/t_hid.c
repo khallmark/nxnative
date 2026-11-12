@@ -13,6 +13,11 @@ static int hid_usleep(useconds_t usec);
 #include "../pad_slots.h"
 void dm_oe_execute(int index, const void *param, size_t n) { (void)index; (void)param; (void)n; }   // DM_CTL "program", "webshot": not exercised here
 void front_web_shot(const char *path) { (void)path; }
+// These newer DM_CTL diagnostics are not exercised by t_hid's older stub set.
+void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; }
+void dm_gfx_addr_note(uint64_t address, char *note, size_t n) { (void)address; if (n) *note = 0; }
+void dm_gfx_bufsnap(const char *key, uint64_t address, size_t n, const char *path) { (void)key; (void)address; (void)n; (void)path; }
+
 // The controller applet's prompt (front.h): -1 is no window; a test sets the answer and the players that join while it is up
 static int g_prompt_answer = -1, g_prompt_calls, g_prompt_min, g_prompt_max; static uint32_t g_prompt_join;
 int front_ctrl_support(int min, int max) { g_prompt_calls++; g_prompt_min = min; g_prompt_max = max; if (g_prompt_join) dm_pad_players(g_prompt_join); return g_prompt_answer; }

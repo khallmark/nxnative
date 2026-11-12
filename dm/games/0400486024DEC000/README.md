@@ -89,6 +89,252 @@ Run headless, `DM_CTL` at a control file. The work folder has `boot.sh <secs> <l
 
 From an empty save: at about 45 s `A` (title), `A` (New Game), then the movie. From `save_ref`: at about 58 s `A~0.2`, 5 s later `A~0.2` (Load), 30 s later three `A~0.1` 3 s apart, then 12 s to the bridge outside Link's house. There `LUp~3.5`, `A~0.2` (Climb Down) and `LDown~4` three or four times reach the village floor.
 
+## In-place training checkpoints
+
+Current, Mac only, NSO build `e0f3ccfaf50065ae4ea01eb5aeb13b1a`: the optional
+[`player_checkpoint.js`](player_checkpoint.js) bridge restores a calibrated player
+pose and health while the scene remains loaded. Its generic runner contract is in
+[the evolution guide](../../../docs/evolution.md#in-place-player-checkpoints).
+The native player/controller warp is `main+0xc6fb30`, called with a row-major
+Matrix34 and mode 0. The default path uses the game-stack callback at
+`main+0x3303ca0`; with `reset_action: true`, both Wait and the later warp run in
+the actor callback at `main+0xcba80`, while Main only validates the result. The
+bridge checks the native stack and host-gate bounds and restores virtual x18; direct
+JavaScript FFI calls into guest code are not a substitute for that bridge.
+
+The authoritative health record is reached from player components at `+0x270`,
+entry 87, life component `+0x1c10`, record `+8`. The life component's `+0x1ca8`
+value is a mirror. Ownership, vtables, pointer chain, gameplay UI and current
+writable memory are checked before health changes. The optional
+[`lethal_checkpoint.js`](lethal_checkpoint.js) observes the damage CAS at
+`main+0x49dcf8` and its success-only continuation at `main+0x49dd08`; it requests
+[atomic native terminal recovery](../../../docs/reference/threads.md#native-replay-terminal-events-before-checkpoint-restoration)
+for the exact replay epoch. Its initial preparation installs no hooks.
+
+Measured in a Kokiri Forest training session on 2026-11-12: three player restores
+matched the calibrated checkpoint position/rotation and health 10, with all 14 save
+hashes unchanged. Repeated uncached range checks cost 5.68–5.80 s; an independent
+read-only benchmark found a heap `Process.findRangeByAddress` lookup cost 658–673 ms,
+while CModule compilation cost 0–1 ms. Keeping validated spans and the bridge in
+one attachment reduced initial setup plus restore to 1.432 s and the next two
+complete restores to 72.8 ms and 72.0 ms. The native checkpoint used three distinct
+stable frames. The actual Python adapter then verified two warm at-rest restores
+in 85.70 ms and 76.05 ms, after 8.404 s of initial preparation. Normal guarded
+Load retries in that session cost about 13.7 s. These are checkpoint request
+timings; the measured game still simulates about 60 frames per second.
+
+The first natural lethal hit crossed health 1 to 0 at replay frame 25437. The
+native transaction preserved terminal health 0 and recovered live health to 10.
+The following checkpoint completed its dryrun but did not verify the saved pose;
+cleanup errors obscured the original failure. The host kept running and all 14
+save hashes stayed unchanged. Continuous training resumed with guarded Load.
+This proves terminal scoring and health recovery, not death-to-next-attempt reset.
+A second pilot verified an ordinary moving reset in 98.78 ms, then reproduced the
+lethal failure. The warp returned and restored health, but 1,323 subsequent
+readbacks never matched the checkpoint. The bridge now preserves the first
+readback, current physics state and the original error; an unstable warp fails
+after 60 guest frames instead of waiting through further damage.
+
+The opt-in `reset_action: true` candidate first requests the engine's `Wait`
+action (verb 40, slot 0) at `main+0xcba80`, after the actor update clears its
+execution flags and before scheduler evaluation. It calls `main+0xc08f0` once,
+checks acceptance and the selected action, then allows the normal actor update
+to proceed before warping on a strictly later actor frame. The request executes
+synchronously; this separation does not assume deferred action execution. The
+later callback revalidates ownership, stack/context, health permissions and
+selected Wait without requesting it again. A separate 60-frame pre-warp deadline
+bounds a missing actor callback. Bind fresh `action_bsa`,
+`action_bsa_vtable` and `action_slot0` addresses and both extra code fingerprints.
+The callback verifies actor/BSA registers, ownership, the native stack and thread
+context. Main performs the subsequent stability reads. The default leaves this
+experimental action request disabled. Before separating the action and warp,
+a controlled lethal pilot on a fresh host passed: after a recorded artificial health change from 10 to 1, a real boulder
+hit produced terminal health 0 at frame 9137. The action request and warp ran at
+9140, then frames 9141–9143 verified the checkpoint and health 10. Python measured
+104.55 ms from reset request to verification, with no menu input. This probe has
+no fitness database and is not full-health survival evidence. The continuous trainer then completed two ordinary 7,200-frame attempts, each
+ending with health 1, and automatically restored checkpoint health 10 in 107.69
+and 114.89 ms. The first terminal-to-next-start gap was eight guest frames.
+A natural lethal cycle starting at the normal checkpoint health remains under
+observation; the diagnostic injury is not mixed into its fitness.
+
+A later movement/camera pilot exposed resumed movement after a successful warp:
+frame 10262 placed the player; the first readback at 10263 matched the anchor and
+health 10, but after 60 readbacks the player was 0.4568 units away and rotation
+matrix error reached 0.9828. No health, identity or native-call error explained
+that drift. Earlier accepted resets moved 0.045 units within their acceptance
+window. The candidate now also requires consecutive-frame position and maximum
+rotation-element changes of at most 0.005; duplicate and skipped frames cannot
+manufacture a stationary proof. The existing anchor/health bounds and post-warp
+60-frame deadline remain. The two-stage change passed the same nine-movement plus final-reset preflight
+on a fresh process. The final proof requested Wait at frame 8235, warped at 8236,
+and accepted three consecutive low-motion samples ending at 8242. Final position
+was 0.061 units from the anchor, inside the configured 0.3 tolerance, with health
+10. Warm preflight restores took 106.6–177.0 ms. The same attachment then entered
+continuous 600-frame qualification: twelve ordinary trials and thirteen starting
+resets measured median 126.23 ms (103.80–161.27 ms range), with matching health and
+motion proofs and all 14 save hashes unchanged. Initial preparation took 10.309 s
+and is excluded. End-to-end throughput was 5.684 attempts/minute, compared with
+2.533 using normal loads at the same horizon. This measures retries and bounded
+qualification, not simulation acceleration or a natural-death cycle in this new
+candidate. No unload/re-attachment occurred between preflight and training.
+
+After that failed pilot, both script unload calls timed out despite restored
+instruction bytes and a successful completed-state snapshot. The cause remains
+unresolved; descriptor restoration is not an unload acknowledgement. Continuous
+training resumed with normal Load recovery and no fresh instrumentation attachment
+to that process. All 14 save hashes remained verified.
+
+The camera-direction calibration is supported by 110 archived walking intervals:
+projected matrix columns predict travel with median angular error 2.83 degrees,
+versus 77.72 degrees for the transposed rows. `PlayerCamera + 0x328` holds the
+nine-float camera-to-world rotation; self at `+0x168`, common actor vtable at `+0`,
+and exact name `PlayerCamera` through the pointer at `+0x260` identify the known
+actor. The vtable alone is shared with other actors. The host's optional
+[world-direction replay](../../../docs/reference/services.md#repeated-movement-genes-follow-a-changing-camera)
+can bind self and vtable while the session validates the name. No active-camera
+global was proved; this is calibrated for ordinary gameplay, not cutscenes.
+Standalone X input produced a measured 0.62-unit jump arc with unchanged health;
+A as dash and Y as attack remain unverified. Three 12-frame world-direction
+trials spanning 106.8 degrees of camera yaw had 4.05 degrees of movement-heading
+spread and 0.0742 units of endpoint spread, with unchanged health. The first no-button/A/B pairs were confounded by resumed movement after reset.
+Repeating them after the two-stage correction kept headings near -39 degrees:
+A increased 24-frame travel about 14.7 percent in both orders, while B did not.
+This establishes a short-hold movement gain, not sustained sprint/stamina behavior. A six-second
+route probe initially had no verified target landing; the later acquisition below
+is a separate observed milestone. Shorter 600-frame route qualification is explicitly censored; 7200-frame survival
+validation belongs to a separate experiment and imports genes, not fitness.
+
+This player checkpoint keeps camera, hazards, animation, random state, inventory
+and quest progress running. Session addresses need fresh discovery after a process
+restart. Original save archives remain separate and unchanged. Continuous instant
+death recovery is being checked in ordinary training attempts.
+
+A later generation-four candidate acquired the Kokiri Sword through normal input.
+The game displayed the acquisition text, then the sword on Link's back and the
+Swing Sword prompt after ordinary dialogue advancement. Its chromosome differed
+from the initial seed at 131 of 768 genes. The interrupted attempt ended at
+relative frame 333, with health 10 and position approximately
+`[-81.9703, 122.2561, 33.7080]`. The exact chromosome, native timeline, database,
+image and observation were archived outside the repository. This establishes one
+successful acquisition; it does not establish repeatability or completion of the
+game. The evaluator rejected the item UI before writing a fitness row, so this
+milestone is kept separately from scored trials. Prior same-seed fitness changes
+were not evidence of genetic improvement. A new 14-file save archive preserved
+the sword checkpoint; a normal Load restored its exact saved position and health
+10/12, with the sword still equipped and chest open. Earlier checkpoint archives
+were retained. No boss or ending is established.
+
+Before that item interruption, 37 completed 600-frame attempts measured 5.479
+attempts/minute, including reset. Their 38 starting resets had median 125.96 ms
+and range 103.64–260.25 ms. These are warm player resets; the earlier 10.309-second
+initial preparation is separate. The subsequent idle period was caused by the
+item UI entering runner shutdown, followed by another cancelled Frida unload.
+All six original hook sites were readable and restored, but that does not prove
+that remote teardown completed. No new attachment was made to that process.
+
+The subsequent forest run retained the sword and used a newly saved, normal-reload
+verified checkpoint. Its timed routes overshot the village waypoint while replay
+throughput fell to roughly 28–31 presented frames/s. A read-only render sample
+measured GPU p50 28.68 ms and whole-frame p50 33.17 ms, with no new pipeline or
+shader-library build time in that sample. Game-time and wall-time intervals were
+both approximately 60.2 seconds. These observations distinguish steady rendering
+cost from the subsecond player reset and motivate native position feedback.
+
+The optional [target-feedback policy](../../../docs/evolution.md#native-target-feedback-genes)
+passed a walking-only live qualification at the saved forest checkpoint. The
+pilot measured a quiet terrain position, verified health 6, cancelled input and
+restored the checkpoint before constructing a fresh 1,024-gene experiment.
+Three different candidates then achieved stable 3D arrival with no damage;
+these were interleaved candidates, not repeatability trials of one policy.
+Each ran 600 frames in 19.07–19.45 seconds. Four warm starting restores measured
+167.73–280.20 ms; cold preparation took 7.588 seconds. All fourteen save hashes
+remained unchanged. No new quest, boss or ending is implied.
+
+The first logged target proximity occurred at frame 121–122, leaving about
+15.2–15.5 seconds until the horizon. Sparse logs do not establish the exact
+first stable-success time. The inferred inter-attempt gaps were 230.44 and
+286.35 ms, including restores of 223.39 and 280.20 ms. This distinguishes
+[post-arrival horizon waiting](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying)
+from actual reset latency.
+
+A subsequent separately fingerprinted run enabled `stop_on_objective` and retained
+only the living player checkpoint script, with every optional lethal-hook key
+omitted. Its first 15 attempts all completed the objective. Across 14 automatic
+warm retries, player restore median was 206.89 ms (147.57–283.15 ms), and the
+observed terminal-to-next-replay-ACK median was 216.49 ms (155.17–290.91 ms).
+Native terminal-to-next scheduled input gaps were 6–10 guest frames. All reset
+stage proofs and fourteen save hashes passed. Cold setup took 5.799 seconds.
+Navigation median was 4.371 seconds; a mutated policy took 16.812 seconds, so
+actual cumulative throughput was 9.15 attempts/minute, not a uniform four-second
+cycle. Default survival mode still runs to death or its horizon. No natural death
+occurred in this qualification; death uses ordinary recovery while lethal hooks
+are excluded. This isolates instrumentation and does not establish a crash fix.
+
+The living-only run later reached 77 successful objective completions. Its next
+reset failed the 60-frame post-warp stability deadline: the first readback
+matched the checkpoint, but the player subsequently settled about 0.107 units
+away with roughly opposite facing. Health and final motion deltas were valid;
+the required target rotation was not. All 77 successful starting resets had the
+exact target rotation, including some with larger position drift (up to 0.127
+units). The source of the later rotation change remains unresolved. The trainer exited after a cancelled bounded unload. The
+host stayed alive, all four original actor-hook sites and fourteen save hashes
+were verified, and ordinary native gameplay continued without another Frida
+attachment. The shorter successful timing samples do not prove indefinite reset
+reliability.
+Ordinary native gameplay then collected eight more rupees (16 to 24) and a
+recovery heart (health 6 to 10), reaching the shop. A new fourteen-file checkpoint
+archive was verified by normal Save/Load at `[-1.62644, 110.20952, -23.27541]`,
+health 10/12, with earlier archives preserved. The sword remains owned and the
+shield remains missing; these village gains came from supervised ordinary
+controls, not a scored genetic-policy qualification.
+
+[Progression handoff](../../../docs/evolution.md#progression-after-a-qualified-objective)
+preserves a qualified candidate at its reached waypoint before the old checkpoint
+is restored. It supplies supervised bounded movement, not automatic checkpoint
+adoption or completion of the game's remaining objectives.
+
+The shop qualification subsequently completed five scored trials with health 10
+and no damage. Candidate zero passed both interleaved repeats; the resident owner
+held at the reached doorway without another checkpoint restore. An observation
+and a six-frame button-free movement used that same owner, verified inactive
+terminal input and preserved all fourteen save hashes. Navigation took
+1.55–2.07 seconds. This no-Frida run used ordinary Load (about 14–15 seconds), so
+it validates progression handoff rather than fast-reset performance.
+
+### Rotation divergence diagnostics
+
+The reset-yaw cause remains open. The opt-in `rotation_diagnostics: true` requires
+`reset_action: true` and a fresh, verified fingerprint for `main+0x539e20` under
+`address_binding.code_fingerprints["0x539e20"]`. It records accepted Wait,
+completed warp, first Main readback, and the first later rotation mismatch after
+a target-matching readback. Each of four immutable records has its own thread,
+frame and phase, checked actor pose, action selection/flags, and controller
+direction/scalars/flags. The captures use existing native ownership claims and
+recheck frozen pointer chains, mapped spans and code identity. Guest observations
+are not atomic across all fields. Invalid diagnostic data is marked unavailable
+without changing the reset error or completion predicate.
+
+The full trace is `evidence.diagnostics.rotation_trace` in terminal messages and
+`diagnostics.rotation_trace` in snapshots. With this opt-in, the top-level terminal
+diagnostics and nested dryrun diagnostics are summaries to avoid duplicating the
+trace. Constructed maximum restored/failed Python JSON messages measured
+11,811/11,944 bytes, with snapshots 19,900/20,059 bytes, below the existing
+16 KiB and 32 KiB limits. The exact native C passed normal and ASan/UBSan tests,
+including first-divergence retention and invalid mapping/identity cases; the
+219-test evolution slice passed. Live diagnostic reproduction is pending. No
+reset deadline, target tolerance, warp mode or one-shot mutation rule changes,
+and no yaw fix or improved reset reliability is claimed.
+
+The earlier fully instrumented run's fourth candidate crashed with SIGBUS: PC and fault address were
+`main+0x4cbf040`, the `GetTlsValue` import slot, with LR `main+0x49dea4`
+in the health-update function containing the optional lethal hooks. Bounded
+disassembly matches the saved scratch registers to the import thunk and SDK
+TLS patch, but does not establish why execution jumped into that data slot. The exact candidate, timeline,
+database and process logs were retained. The trainer's later communication
+errors followed host loss. Repeated natural-death recovery and long-running
+stability with the instrumentation remain open.
+
 ## Open
 
 - Root cause confirmed on M4 Pro (2026-11-08): [ignored event waits](../../../docs/reference/nvn-objects.md#gpu-event-waits-order-work-across-queues) let lighting consumers run before their producers. The game issues about 25 waits and 19 signals per frame. All 297 complete traced frames submit queue 5's ambient-cache consumer `9e6b00b050e30801` before queue 1's SH producer `21d9f83e6027c565`, despite the explicit dependency. Queue 1 also waits for the CPU frame-ready event after the CPU clears the lighting buffer. At frame 3872 the consumer ran at 0.686 ms, the clear at 0.966–0.968 ms, and the producer at 1.282 ms; its release followed at 4.467 ms. Exposure writer `1bba09ec4bc8ff67` has another event dependency. The native SDK's flush/invalidate functions are no-ops for these coherent pools.
@@ -127,6 +373,12 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [A checkpoint matches once and later turns](../../../docs/reference/services.md#a-checkpoint-matches-once-and-later-turns): bounded per-stage evidence distinguishes a later controller update from a failed placement without relaxing reset validation.
+- [A qualified navigation policy resets the reached milestone](../../../docs/reference/services.md#a-qualified-navigation-policy-resets-the-reached-milestone): a resident objective boundary preserves a fully repeated candidate and enables supervised continuation before checkpoint restoration.
+- [A successful navigation trial waits before retrying](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying): the forest trials spent about fifteen seconds after first logged target proximity before their fixed horizon; explicit objective termination separates navigation speed from survival evaluation.
+- [Timed movement overshoots when presented frames slow down](../../../docs/reference/services.md#timed-movement-overshoots-when-presented-frames-slow-down): guarded native target steering adds position feedback and braking; live terrain/deadzone qualification remains separate from the synthetic model.
+- [Item dialogue interrupts a native training episode](../../../docs/reference/services.md#item-dialogue-interrupts-a-native-training-episode): the sword acquisition exposed a lifecycle interruption distinct from warm reset latency. The opt-in `--resident-handoff` retains the winning candidate and attachment while a supervisor handles the dialogue; it does not classify unknown UI as success or resume an obsolete objective.
+- [Live scripted actions wait for every observation](../../../docs/reference/services.md#live-scripted-actions-wait-for-every-observation): a native frame-timeline backend for the genetic trainer removes Python from per-action input. In the first whole-attempt Mac pilot, 7,200 frames took 132.166 s (54.477 frames/s), with two damage units and no objective success; the horizon is censored, not a death. The normal checkpoint reset took 13.679 s and the next mutated candidate started automatically. Twenty native observations had median turnaround 1.988 ms; this is transport latency, not a whole-game acceleration factor. Actual native death/recovery, accelerated-clock fidelity and full-game completion remain unverified. Earlier normal-input death calibration reached Game Over and Try Again; only option metadata changed on Continue. The HUD remains visible at Game Over, so zero health cannot count as gameplay.
 - [Draw passes that wait for each other again while images share memory](../../../docs/reference/frame-rate.md#draw-passes-that-wait-for-each-other-again-while-images-share-memory): resolved, `draw_barriers game` was off whenever family heaps existed, and fragment-only barriers forced full ones; M1 Max gameplay frame 23.4 → 21.7 ms.
 - [A shader build's Python finishes one shader at a time](../../../docs/reference/shaders.md#a-shader-builds-python-finishes-one-shader-at-a-time): resolved, the whole Mac map's cold build took 58 minutes on an M3 Max with 4 to 5 of its 16 cores busy; 30 minutes with worker processes.
 - [Reads past a uniform binding's size](../../../docs/reference/shaders.md#reads-past-a-uniform-bindings-size): open ([GitHub issue #2218](https://github.com/seedds/nxnative/issues/2218)), long white streaks from the horses at Lon Lon Ranch and from Link's slingshot, and flickering parts of the slingshot and of the ReDeads' faces, reported with the uniform read bound on. The bound now takes the size the driver gives the GPU, rounded up to 256 bytes; the game binds sizes that are not multiples of 256. Not reproduced here before or after (the slingshot at Link's house, the ReDeads of adult Castle Town), so the reporters' retest decides.

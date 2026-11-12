@@ -305,3 +305,14 @@ The yield back-off (`DM_YIELD_BACKOFF`) and the rewriter's spin waits (`patch_ns
 - **Note:** on Horizon too this order comes from the time a request takes, not from a guarantee; the 200 µs is a model of that, so a starter stopped by the host for longer than that at this exact point would lose the race as before. Only file system calls are service requests here so far; another HLE that stands for a blocking request would call the same function when a game shows it needs that. Waking (not starting) a thread gets the release but no wait, so a reading thread woken for every request does not pay 200 µs each time.
 - **Check:** `make -C dm/host/tests GAME=<id> preempt` (`service_request_start`): with no request the starter is held to the worker's end and the flag stays set, as the game saw it; with one or two, in both scheduling modes, the worker sees the flag and clears it. On the game: a save, reopening the screen, loading and saving again, twelve overwrites in a row, a restart.
 - **Found on:** [Digimon Story Cyber Sleuth: Complete Edition](../../dm/games/010014E00DB56000/README.md#saves) ([issue #769](https://github.com/seedds/nxnative/issues/769)).
+
+
+## Training replay
+
+### Native replay terminal events before checkpoint restoration
+
+- **Symptom:** restoring health before the next HID poll can hide a lethal hit from a training episode, or a late callback can heal a replacement episode.
+- **Cause:** the ordinary replay guard samples health once per guest frame. A game hook and replay replacement can occur between those samples, so a separate epoch check and memory write are not one transaction.
+- **Fix:** `dm_replay_terminal_restore` validates the replay epoch, guard address, threshold crossing and writable storage under the replay mutex, compares and exchanges the committed terminal HP to checkpoint HP, then freezes terminal HP/frame and releases scripted input. A matching death already observed by HID retains its earlier stop frame. Replaced, cancelled and completed epochs, changed HP and duplicate events are rejected. The game hook must prove actor ownership and a successful original write. `dm_replay_terminal` provides terminal publication without a memory write when restoration is managed separately.
+- **Found on:** [Ocarina of Time training checkpoints](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints); callback and host behavior are covered by synthetic tests, while the game note tracks live validation.
+- **Check:** `t_replay` covers stale/replaced epochs, threshold and address mismatches, already-observed death, duplicate callbacks, unwritable or unmapped storage, immediate scripted-input release and terminal truth retained after health recovery.

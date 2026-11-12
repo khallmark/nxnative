@@ -412,3 +412,11 @@ coverage:
 	rm -rf $(B)/cov/prof
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
+
+# Live replacement timelines, batched observations and concurrent input ownership.
+$(B)/t_replay: t_replay.c t_hid.c ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_replay.c ../hle_haptics.c ../hle_bigstack.c
+.PHONY: replay
+replay: $(B)/t_replay
+	$(B)/t_replay
+run: replay

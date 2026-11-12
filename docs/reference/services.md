@@ -310,6 +310,62 @@ Most service calls can be found before they crash, before the first boot or the 
 
 ## Input
 
+### Live scripted actions wait for every observation
+
+- **Symptom:** a Python game controller waits for a 100 ms control-file poll and memory dumps between short button holds; releases between samples prevent continuous dash and make input throughput depend on observation latency.
+- **Cause:** ordinary `DM_CTL` key commands execute bounded wall-time holds on the control thread, while startup `DM_KEYS` is not replaceable between attempts.
+- **Fix:** protocol-1 `replay` replaces a validated relative frame timeline under the HID mutex. Input is applied at guest reads; adjacent holds stay continuous. Native health guards release input and freeze the terminal frame. Atomic ACKs report epochs and outcomes; `replay_observe` batches safe memory reads with frame brackets and explicit per-read errors. `DM_CTL_POLL_US` optionally reduces command latency. Legacy seconds scripts block replacement, and manual commands cannot interrupt active replay. See [whole-attempt evolution](../evolution.md#native-whole-attempt-evolution) for limits and commands.
+- **Check:** `make -C dm/host/tests GAME=<id> replay` covers the existing HID baseline, parsing, replacement, cancellation, death/read errors, observations and concurrent HID/replay use. Python tests verify chunking, exact death-frame scoring, recovery and persistent many-gene evolution. Live speed and accelerated-clock fidelity require separate measurements.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), during checkpoint-based navigation training on macOS.
+
+### Item dialogue interrupts a native training episode
+
+- **Symptom:** a genetic candidate obtains an item, then the trainer exits and leaves the game waiting in dialogue; the acquired milestone has no trial record.
+- **Cause:** the evaluator treats living non-gameplay UI as an ordinary failure. Top-level cleanup then unloads the resident reset scripts, even though episode disarm and input cancellation already completed. A deferred instrumentation unload can stall separately from the subsecond player reset.
+- **Fix:** a typed interruption preserves the observation, native status and compiled timeline. After acknowledged episode cleanup, the runner archives the candidate; with `--resident-handoff`, it waits with the same attachment and bridge lock. Without the flag, it archives the interruption and follows ordinary shutdown. It assigns no fitness and performs no reset or automatic dialogue input. Explicit nonce-bound, sequenced commands may request one bounded button action guarded by existing telemetry reads, or request shutdown. Unresolved output and control-file markers block automatic startup restoration, even when only the output path changes; a new milestone needs a separately validated checkpoint and experiment.
+- **Check:** episode and runner tests cover active/horizon UI overlap, death precedence, failed disarm/cancellation, retained ownership, exact evidence, guarded commands, duplicate sequences and startup with a pending handoff. This avoids initiating teardown on ordinary UI; it does not establish the cause of, or recover from, an already cancelled remote unload.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), when a mutated chromosome acquired the Kokiri Sword.
+
+### Repeated movement genes follow a changing camera
+
+- **Symptom:** identical native input chromosomes diverge after player-only checkpoint restores, even when the starting position matches.
+- **Cause:** left-stick values are camera-relative and the reset retains camera auto-follow state. Applying a transform only at a segment boundary also becomes stale during a held gene.
+- **Fix:** opt-in `world_xz` replay binds a nine-float camera-to-world matrix and two generic uint64 identity guards. Under the existing HID mutex, the host safely rereads the binding once per guest frame and solves its horizontal basis for scripted left axes. Button/touch transitions remain segment-based; camera-relative default, physical input, right stick, health terminal checks and epochs retain their behavior. Read, identity or basis errors release scripted input. See [world-direction movement genes](../evolution.md#world-direction-movement-genes) for the schema and limits.
+- **Check:** native replay tests exercise yaw/pitch, per-frame changes inside a hold, invalid bindings, terminal precedence and physical input. The Python adapter verifies the exact ACK and excludes the option from UI recovery. Camera actor identity does not prove active-camera selection in a cutscene; full-matrix reads are not atomic scene snapshots.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), where four pairs of the same genome began within 0.032 world units but separated by 1.33–13.63 units after about 120 frames. Their starting camera yaw differed by 10.38–157.17 degrees; continuously evolving hazards remain another source of variation.
+
+### Timed movement overshoots when presented frames slow down
+
+- **Symptom:** an identical fixed-frame movement chromosome travels too far when rendering falls from roughly 60 to 30 presented frames per second.
+- **Cause:** replay counts presented frames while the game can advance more simulation time per presentation. Camera normalization does not correct a held movement's physical duration or stop at its objective.
+- **Fix:** optional guarded `position_xyz` replay and `G` goal tokens compute horizontal steering and distance-based braking in the native input loop each new frame. The existing camera transform supplies direction; feedback preserves the requested controller magnitude. A versioned many-gene policy evolves target offsets, strength, slowdown, buttons and holds. Legacy input, death/epoch precedence and 3D objective scoring remain unchanged. See [target-feedback genes](../evolution.md#native-target-feedback-genes).
+- **Check:** native tests cover guarded position reads, token conflicts, invalid replacement, camera skew, same-frame caching, terminal precedence and concurrent replacement. Synthetic 30/60 Hz plants, including a hypothetical deadzone, test braking; they do not establish live terrain/deadzone behavior. Jump and waypoint-transition timing still use presented frames.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), while returning from the sword checkpoint toward the village.
+
+### A successful navigation trial waits before retrying
+
+- **Symptom:** the player reaches the waypoint and stands still for many seconds before an apparently slow reset.
+- **Cause:** survival evaluation deliberately continues to its fixed horizon after stable objective arrival. In one forest run, the first logged target proximity was at frame 121–122, but every completed attempt ran to frame 600; the actual warm restore was subsecond.
+- **Fix:** opt-in `stop_on_objective` ends navigation qualification after the existing confirmed 3D stability criterion and a verified cancellation acknowledgement. Death, completed horizons and living UI retain precedence; cleanup failure cannot publish fitness. Successful objective results reward earlier arrival. Survival mode remains the default, and the option belongs to the experiment fingerprint. First confirmed arrival is logged in both modes so idle horizon time and reset latency can be measured separately.
+- **Check:** episode tests cover default survival, early objective termination, terminal/cancellation races, invalid acknowledgements and cleanup failures. Score tests distinguish faster successful navigation from longer survival. See [whole-attempt evolution](../evolution.md#native-whole-attempt-evolution).
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), during forest target-feedback qualification.
+
+### A qualified navigation policy resets the reached milestone
+
+- **Symptom:** the trainer repeatedly solves a waypoint and returns to its old checkpoint instead of retaining the reached state for further play.
+- **Cause:** the native runner unconditionally restores after every recorded result. A single successful row also does not establish a qualified candidate because the scheduler interleaves candidates across repeats.
+- **Fix:** optional progression handoff requires objective termination and a complete successful task/repeat set for one exact generation/candidate. Publish a control-scoped preparing intent before committing the final qualifying trial, archive its supporting rows and verified terminal evidence, and hold the same owner before any restore. Bounded observation, ordinary button input and button-free world movement allow supervised progression. No new checkpoint adoption or automatic resume is implied. Partial intents block startup even with a different output directory.
+- **Check:** runner and handoff tests cover interleaved qualification, durable pre-record barriers, incomplete publication, scored objective versus unscored UI evidence, unchanged default resets, stale commands, movement interruption and cancellation failures. See [progression after a qualified objective](../evolution.md#progression-after-a-qualified-objective).
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), after repeated forest waypoint qualification.
+
+### A checkpoint matches once and later turns
+
+- **Symptom:** a native player warp initially matches the checkpoint, then settles with different facing and fails the post-warp stability deadline.
+- **Cause:** open. Initial placement succeeded, but existing first/final samples do not identify the later rotation writer. Translation drift also occurs in successful resets and is not sufficient evidence of the yaw cause.
+- **Fix:** unresolved. Optional diagnostics retain accepted action, completed warp, first readback and first later rotation divergence inside existing native claims. Capture immutable frame/thread/phase and checked action/controller state; reject invalid diagnostic identities without replacing the original reset error. Keep the one-shot mutation, target predicate and deadlines unchanged while investigating.
+- **Check:** exact native C tests cover default behavior, delayed divergence, identity/mapping/code rejection and immutable first capture; envelope tests retain the 16 KiB message and 32 KiB failure-snapshot limits. Live reproduction and a behavioral fix remain pending.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#rotation-divergence-diagnostics), after 77 successful living starts.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).
