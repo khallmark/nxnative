@@ -10,7 +10,8 @@ import time
 import traceback
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'dm'/'tools'))
 from evolution.core import Evolution
-from evolution.episodes import NativeEpisodes,validate_episode
+from evolution.episodes import NativeEpisodes,NativeUIInterruption,validate_episode
+from evolution.handoff import assert_no_pending_handoff,wait_for_handoff
 from evolution.live import TrialStopped,ui_matches
 from evolution.replay import ReplayBridge
 from evolution.reset import FridaReset,prepare_fast_reset
@@ -28,6 +29,7 @@ def main():
     ap.add_argument('--mutation-rate',type=float,default=.1)
     ap.add_argument('--mutation-sigma',type=float,default=.12)
     ap.add_argument('--seed-champion',type=Path)
+    ap.add_argument('--resident-handoff',action='store_true',help='Keep the same attachment resident for explicitly guarded UI commands')
     args=ap.parse_args()
     if args.generations<0:ap.error('generations must be nonnegative')
     config=json.loads(args.session.read_text());spec=json.loads(args.objective.read_text());validate_episode(spec)
@@ -35,10 +37,11 @@ def main():
     # This open-loop GA needs player/health/UI observations, not actor rediscovery.
     config.pop('actor_discovery',None)
     args.output.mkdir(parents=True,exist_ok=True)
+    assert_no_pending_handoff(args.output,config)
     config['checkpoint_state']=str((args.output/'checkpoint-state.json').resolve())
     prepared=prepare_fast_reset(config)
     package=Path(__file__).resolve().parents[1]/'dm'/'tools'/'evolution'
-    implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py','reset.py'))])+json.dumps(config,sort_keys=True).encode()+(prepared.fingerprint() if prepared else b'')).hexdigest()
+    implementation=hashlib.sha256(b''.join(p.read_bytes() for p in [Path(__file__),*(package/n for n in ('core.py','live.py','replay.py','timeline.py','episodes.py','reset.py','handoff.py'))])+json.dumps(config,sort_keys=True).encode()+(prepared.fingerprint() if prepared else b'')).hexdigest()
     initial=json.loads(args.seed_champion.read_text())['genome'] if args.seed_champion else seed_genome(spec.get('segments',128),spec.get('initial_direction',[0,1]))
     evolution=Evolution(args.output/'evolution.sqlite',[spec],args.population,args.repeats,implementation=implementation,
                         bounds=gene_space(spec.get('segments',128)),initial_genome=initial,
@@ -48,6 +51,7 @@ def main():
     bridge=None;backend=None;log=None;primary=None;cleanup_errors=[]
     try:
         bridge=ReplayBridge(config)
+        assert_no_pending_handoff(args.output,config)
         log=(args.output/'trajectory.jsonl').open('a')
         backend=FridaReset(prepared,bridge,log) if prepared else None
         env=NativeEpisodes(bridge,spec,log,backend);env.checkpoint.verify_files()
@@ -65,7 +69,12 @@ def main():
                 tmp.write_text(json.dumps(report,indent=2)+'\n');tmp.replace(args.output/'champion.json')
                 print(json.dumps(dict(event='generation',**report)),flush=True);continue
             print(json.dumps(dict(event='episode_started',key=key,genes=len(initial),reset_seconds=reset_seconds)),flush=True)
-            result=env.evaluate(evolution.state['candidates'][key[1]])
+            genome=evolution.state['candidates'][key[1]]
+            try:result=env.evaluate(genome)
+            except NativeUIInterruption as interruption:
+                wait_for_handoff(bridge,backend,args.output,interruption,key=key,genome=genome,
+                    objective=spec,implementation=implementation,log=log,resident=args.resident_handoff)
+                break
             attempts+=1;result['reset_seconds']=reset_seconds
             result['attempts_per_minute']=attempts*60/max(time.perf_counter()-run_start,1e-9)
             evolution.record(key,result)

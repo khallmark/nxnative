@@ -318,6 +318,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** `make -C dm/host/tests GAME=<id> replay` covers the existing HID baseline, parsing, replacement, cancellation, death/read errors, observations and concurrent HID/replay use. Python tests verify chunking, exact death-frame scoring, recovery and persistent many-gene evolution. Live speed and accelerated-clock fidelity require separate measurements.
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md), during checkpoint-based navigation training on macOS.
 
+### Item dialogue interrupts a native training episode
+
+- **Symptom:** a genetic candidate obtains an item, then the trainer exits and leaves the game waiting in dialogue; the acquired milestone has no trial record.
+- **Cause:** the evaluator treats living non-gameplay UI as an ordinary failure. Top-level cleanup then unloads the resident reset scripts, even though episode disarm and input cancellation already completed. A deferred instrumentation unload can stall separately from the subsecond player reset.
+- **Fix:** a typed interruption preserves the observation, native status and compiled timeline. After acknowledged episode cleanup, the runner archives the candidate; with `--resident-handoff`, it waits with the same attachment and bridge lock. Without the flag, it archives the interruption and follows ordinary shutdown. It assigns no fitness and performs no reset or automatic dialogue input. Explicit nonce-bound, sequenced commands may request one bounded button action guarded by existing telemetry reads, or request shutdown. Unresolved output and control-file markers block automatic startup restoration, even when only the output path changes; a new milestone needs a separately validated checkpoint and experiment.
+- **Check:** episode and runner tests cover active/horizon UI overlap, death precedence, failed disarm/cancellation, retained ownership, exact evidence, guarded commands, duplicate sequences and startup with a pending handoff. This avoids initiating teardown on ordinary UI; it does not establish the cause of, or recover from, an already cancelled remote unload.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), when a mutated chromosome acquired the Kokiri Sword.
+
 ### Repeated movement genes follow a changing camera
 
 - **Symptom:** identical native input chromosomes diverge after player-only checkpoint restores, even when the starting position matches.

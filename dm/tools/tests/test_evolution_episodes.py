@@ -1,6 +1,7 @@
 """Whole-attempt terminal evidence and reset sequencing, without a live game."""
 import hashlib
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -8,7 +9,7 @@ import unittest
 from typing import Any
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from evolution.episodes import NativeEpisodes
+from evolution.episodes import NativeEpisodes,NativeUIInterruption
 from evolution.live import Checkpoint,TrialStopped,validate_ui,ui_matches
 from evolution.timeline import seed_genome
 
@@ -27,12 +28,14 @@ class FakeBridge:
         else:
             self.native_status,health=row;position=[1,0,0]
             self.after={**self.native_status,'current_frame':self.native_status['observed_frame_end']}
-        return dict(position=position,health=health,reads={'hud':[1]})
+        return dict(position=position,health=health,reads={'hud':[row.get('hud',1) if isinstance(row,dict) else 1]})
     def rpc(self,verb):
         assert verb=='replay_status'
         self.status_calls+=1;self.native_status=self.after;return self.after
     def start_replay(self,*args):self.replay_args=args;return dict(start_frame=100,end_frame=200,epoch=7)
-    def cancel_replay(self):self.cancelled+=1
+    def cancel_replay(self):
+        self.cancelled+=1
+        return {**self.native_status,'active':False,'epoch':7,'reason':'cancelled'}
 
 
 def status(frame,active=True,reason='running',health=10,stop=0):
@@ -67,7 +70,9 @@ class EpisodeTests(unittest.TestCase):
             def arm_episode(self,status,task,address):events.append(('arm',status['epoch'],address))
             def poll_episode(self):events.append('poll')
             def finish_episode(self,status):events.append(('finish',status['reason'],status['last_health']))
-        bridge.cancel_replay=lambda:events.append('cancel_replay')
+        original_cancel=bridge.cancel_replay
+        def cancel():events.append('cancel_replay');return original_cancel()
+        bridge.cancel_replay=cancel
         spec=dict(start=[0,0,0],target=[10,0,0],horizon_frames=100,start_health=10,segments=1)
         result=NativeEpisodes(bridge,spec,io.StringIO(),Backend()).evaluate(seed_genome(1))
         self.assertEqual(result['reason'],'death');self.assertEqual(result['health'],0)
@@ -78,11 +83,69 @@ class EpisodeTests(unittest.TestCase):
         class Backend:
             def arm_episode(self,*args):events.append('arm');raise TrialStopped('lethal arm failed')
             def finish_episode(self,status):events.append('finish')
-        bridge.cancel_replay=lambda:events.append('cancel_replay')
+        original_cancel=bridge.cancel_replay
+        def cancel():events.append('cancel_replay');return original_cancel()
+        bridge.cancel_replay=cancel
         spec=dict(start=[0,0,0],target=[10,0,0],horizon_frames=100,start_health=10,segments=1)
         with self.assertRaisesRegex(TrialStopped,'lethal arm failed'):
             NativeEpisodes(bridge,spec,io.StringIO(),Backend()).evaluate(seed_genome(1))
         self.assertEqual(events,['arm','finish','cancel_replay'])
+
+    def ui_episode(self,terminal=None,backend=None,cancel=None):
+        observed=status(150) if terminal is None else status(201,False,terminal,0 if terminal=='death' else 10,200)
+        bridge=FakeBridge([dict(before=observed,after={**observed,'current_frame':202 if terminal else 152},
+            position=[10,0,0],health=10,hud=0)])
+        if cancel is not None:bridge.cancel_replay=cancel
+        spec=dict(start=[0,0,0],target=[10,0,0],horizon_frames=100,start_health=10,segments=1)
+        log=io.StringIO()
+        return NativeEpisodes(bridge,spec,log,backend),bridge,log
+
+    def test_living_ui_preserves_unscored_evidence_after_verified_cleanup(self):
+        events=[]
+        class Backend:
+            def arm_episode(self,*args):pass
+            def poll_episode(self):pass
+            def finish_episode(self,status):events.append(('finish',status['reason']))
+        env,bridge,log=self.ui_episode(backend=Backend())
+        original=bridge.cancel_replay
+        def cancel():events.append(('cancel',));return original()
+        bridge.cancel_replay=cancel
+        with self.assertRaises(NativeUIInterruption) as caught:env.evaluate(seed_genome(1))
+        evidence=caught.exception.evidence
+        self.assertEqual(events,[('finish','running'),('cancel',)])
+        self.assertEqual(evidence['state']['reads']['hud'],[0]);self.assertEqual(evidence['native_epoch'],7)
+        self.assertIn('f0:',evidence['timeline']);self.assertNotIn('score',evidence)
+        self.assertFalse(evidence['cancel_status']['active'])
+        event=json.loads(log.getvalue());self.assertEqual(event['genome'],seed_genome(1))
+
+    def test_living_ui_overlapping_horizon_is_not_scored(self):
+        env,_,_=self.ui_episode('completed')
+        with self.assertRaises(NativeUIInterruption):env.evaluate(seed_genome(1))
+
+    def test_native_death_precedes_non_gameplay_healed_mirror(self):
+        env,_,_=self.ui_episode('death')
+        result=env.evaluate(seed_genome(1));self.assertEqual(result['reason'],'death')
+        self.assertEqual(result['health'],0);self.assertFalse(result['success'])
+
+    def test_failed_lethal_cleanup_never_enters_handoff(self):
+        class Backend:
+            def arm_episode(self,*args):pass
+            def poll_episode(self):pass
+            def finish_episode(self,status):raise TrialStopped('cleanup uncertain')
+        env,bridge,log=self.ui_episode(backend=Backend())
+        with self.assertRaises(TrialStopped) as caught:env.evaluate(seed_genome(1))
+        self.assertNotIsInstance(caught.exception,NativeUIInterruption)
+        self.assertEqual(bridge.cancelled,1);self.assertIn('episode_ui_interrupted',log.getvalue())
+
+    def test_failed_or_wrong_cancel_ack_never_enters_handoff(self):
+        def failure():raise OSError('cancel unavailable')
+        for cancel in [failure,lambda:None,lambda:dict(active=True,epoch=7,reason='cancelled'),
+                       lambda:dict(active=False,epoch=8,reason='cancelled'),
+                       lambda:dict(active=False,epoch=7,reason='death')]:
+            env,_,_=self.ui_episode(cancel=cancel)
+            with self.subTest(cancel=cancel),self.assertRaises((TrialStopped,OSError)) as caught:
+                env.evaluate(seed_genome(1))
+            self.assertNotIsInstance(caught.exception,NativeUIInterruption)
 
     def test_visible_hud_at_death_is_not_gameplay(self):
         config={'ui':{'gameplay':[dict(read='hud',equals=1)]}}

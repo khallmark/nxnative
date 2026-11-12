@@ -17,6 +17,13 @@ def validate_episode(spec):
     if type(spec.get('start_health')) is not int or not 1<=spec['start_health']<=80:raise ValueError('Invalid episode start health')
 
 
+class NativeUIInterruption(TrialStopped):
+    """Unscored living UI evidence, safe to hand off only after cleanup succeeds."""
+    def __init__(self,evidence):
+        super().__init__('Living UI interrupted native episode')
+        self.evidence=evidence
+
+
 class NativeEpisodes:
     def __init__(self,bridge,spec,log,reset_backend=None):
         validate_episode(spec)
@@ -53,7 +60,7 @@ class NativeEpisodes:
         compiled=time.perf_counter();timeline=compile_timeline(genome,s.get('segments',128),s['horizon_frames']);compile_seconds=time.perf_counter()-compiled
         started=time.perf_counter();status=b.start_replay(timeline,self.health_address)
         start_frame=status['start_frame'];end_frame=status['end_frame'];epoch=status['epoch']
-        last_frame=start_frame;last_progress=started;max_skew=0;next_log=0;pending=None
+        last_frame=start_frame;last_progress=started;max_skew=0;next_log=0;pending=None;interruption=None
         try:
             if self.reset_backend is not None:self.reset_backend.arm_episode(status,self.task,self.health_address)
             while True:
@@ -82,8 +89,14 @@ class NativeEpisodes:
                     health=status['last_health'];frame=status['stop_frame']
                     if terminal=='death' and health!=0:raise TrialStopped('Native death lacked zero health')
                     if terminal=='horizon' and frame<status['end_frame']:raise TrialStopped('Native horizon ended early')
-                elif health>0 and not ui_matches(b.config,state,'gameplay'):
-                    raise TrialStopped('Unexpected UI interrupted native episode')
+                # Death evidence wins over a healed mirror/UI snapshot. A living
+                # UI transition at the horizon is still unscored and needs review.
+                if terminal!='death' and state['health']>0 and not ui_matches(b.config,state,'gameplay'):
+                    interruption=NativeUIInterruption(dict(state=state,observation=dict(observation),
+                        status=dict(status),timeline=timeline,native_epoch=epoch,
+                        frame=max(0,observation['current_frame']-start_frame)))
+                    self.emit('episode_ui_interrupted',**interruption.evidence,genome=dict(genome))
+                    break
                 relative=min(s['horizon_frames'],max(0,frame-start_frame))
                 # Commit position only after a strictly later confirmed frame.
                 # Equality stays pending: death can still land in that same frame
@@ -110,4 +123,10 @@ class NativeEpisodes:
         finally:
             try:
                 if self.reset_backend is not None:self.reset_backend.finish_episode(status)
-            finally:b.cancel_replay()
+            finally:
+                cancelled=b.cancel_replay()
+                if interruption is not None:
+                    if not isinstance(cancelled,dict) or cancelled.get('active') is not False or cancelled.get('epoch')!=epoch or cancelled.get('reason') not in ('cancelled','completed'):
+                        raise TrialStopped('UI interruption input cancellation was not verified')
+                    interruption.evidence['cancel_status']=dict(cancelled)
+        if interruption is not None:raise interruption

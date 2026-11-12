@@ -198,15 +198,37 @@ spread and 0.0742 units of endpoint spread, with unchanged health. The first no-
 Repeating them after the two-stage correction kept headings near -39 degrees:
 A increased 24-frame travel about 14.7 percent in both orders, while B did not.
 This establishes a short-hold movement gain, not sustained sprint/stamina behavior. A six-second
-route probe and subsequent genetic trials still have no verified target landing.
-Shorter 600-frame route qualification is explicitly censored; 7200-frame survival
+route probe initially had no verified target landing; the later acquisition below
+is a separate observed milestone. Shorter 600-frame route qualification is explicitly censored; 7200-frame survival
 validation belongs to a separate experiment and imports genes, not fitness.
 
 This player checkpoint keeps camera, hazards, animation, random state, inventory
 and quest progress running. Session addresses need fresh discovery after a process
 restart. Original save archives remain separate and unchanged. Continuous instant
-death recovery is being checked in ordinary training attempts. No successful chest landing, sword,
-boss or ending has been established by this training run.
+death recovery is being checked in ordinary training attempts.
+
+A later generation-four candidate acquired the Kokiri Sword through normal input.
+The game displayed the acquisition text, then the sword on Link's back and the
+Swing Sword prompt after ordinary dialogue advancement. Its chromosome differed
+from the initial seed at 131 of 768 genes. The interrupted attempt ended at
+relative frame 333, with health 10 and position approximately
+`[-81.9703, 122.2561, 33.7080]`. The exact chromosome, native timeline, database,
+image and observation were archived outside the repository. This establishes one
+successful acquisition; it does not establish repeatability or completion of the
+game. The evaluator rejected the item UI before writing a fitness row, so this
+milestone is kept separately from scored trials. Prior same-seed fitness changes
+were not evidence of genetic improvement. A new 14-file save archive preserved
+the sword checkpoint; a normal Load restored its exact saved position and health
+10/12, with the sword still equipped and chest open. Earlier checkpoint archives
+were retained. No boss or ending is established.
+
+Before that item interruption, 37 completed 600-frame attempts measured 5.479
+attempts/minute, including reset. Their 38 starting resets had median 125.96 ms
+and range 103.64–260.25 ms. These are warm player resets; the earlier 10.309-second
+initial preparation is separate. The subsequent idle period was caused by the
+item UI entering runner shutdown, followed by another cancelled Frida unload.
+All six original hook sites were readable and restored, but that does not prove
+that remote teardown completed. No new attachment was made to that process.
 
 ## Open
 
@@ -246,6 +268,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [Item dialogue interrupts a native training episode](../../../docs/reference/services.md#item-dialogue-interrupts-a-native-training-episode): the sword acquisition exposed a lifecycle interruption distinct from warm reset latency. The opt-in `--resident-handoff` retains the winning candidate and attachment while a supervisor handles the dialogue; it does not classify unknown UI as success or resume an obsolete objective.
 - [Live scripted actions wait for every observation](../../../docs/reference/services.md#live-scripted-actions-wait-for-every-observation): a native frame-timeline backend for the genetic trainer removes Python from per-action input. In the first whole-attempt Mac pilot, 7,200 frames took 132.166 s (54.477 frames/s), with two damage units and no objective success; the horizon is censored, not a death. The normal checkpoint reset took 13.679 s and the next mutated candidate started automatically. Twenty native observations had median turnaround 1.988 ms; this is transport latency, not a whole-game acceleration factor. Actual native death/recovery, accelerated-clock fidelity and full-game completion remain unverified. Earlier normal-input death calibration reached Game Over and Try Again; only option metadata changed on Continue. The HUD remains visible at Game Over, so zero health cannot count as gameplay.
 - [Draw passes that wait for each other again while images share memory](../../../docs/reference/frame-rate.md#draw-passes-that-wait-for-each-other-again-while-images-share-memory): resolved, `draw_barriers game` was off whenever family heaps existed, and fragment-only barriers forced full ones; M1 Max gameplay frame 23.4 → 21.7 ms.
 - [A shader build's Python finishes one shader at a time](../../../docs/reference/shaders.md#a-shader-builds-python-finishes-one-shader-at-a-time): resolved, the whole Mac map's cold build took 58 minutes on an M3 Max with 4 to 5 of its 16 cores busy; 30 minutes with worker processes.

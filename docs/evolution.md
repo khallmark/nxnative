@@ -30,7 +30,7 @@ network or an automatically learned map.
 ```sh
 python3 scripts/evolve_replay.py --session /game/run/native-session.json \
   --objective /game/run/objective.json --output /game/run/native-training \
-  --population 8 --repeats 2 --generations 0
+  --population 8 --repeats 2 --generations 0 --resident-handoff
 ```
 
 The objective JSON declares `start`, `target` (3D points), `start_health`, and
@@ -100,6 +100,51 @@ strictly before a confirmed later active frame or terminal frame. Same-frame
 samples remain pending, so health recovery cannot turn post-death movement into
 objective progress. Measure actual throughput and behavior before claiming speedup
 from `DM_DETCLOCK` or headless mode; a fast timeline compiler is not fast gameplay.
+
+### Resident UI handoff
+
+Item messages and other living non-gameplay UI interrupt an attempt without a
+fitness result, including an observation that also reaches the frame horizon.
+Native death evidence takes precedence over a recovered health mirror. After
+successful lethal-hook disarm and acknowledged input cancellation, the runner
+archives the exact key, genome, compiled timeline, objective and observation in
+`handoffs/<id>/event.json`. `handoff.json` marks the unresolved transition.
+
+With `--resident-handoff`, the same Python process retains its Frida session,
+resident scripts, bridge lock and open logs. It waits for explicit commands and
+performs no reset, population selection or automatic dialogue advancement. Without
+the flag it archives the interruption and then follows ordinary shutdown. This
+retains evidence, but does not avoid a possible instrumentation unload delay.
+
+A supervising controller reads `handoff-ack.json` and atomically replaces
+`handoff-command.json` with one command. Every command needs its current
+`handoff_id`, the exact `next_sequence`, and an `action`:
+
+| Action | Additional fields | Behavior |
+| --- | --- | --- |
+| `input` | `expected_epoch`, nonempty `expected_reads`, `keys`, `hold_seconds`; optional `expected_ui` | Revalidates identities, living health and idle ownership, then sends one guarded ordinary button or neutral hold of 0.05–0.5 seconds through the same bridge. |
+| `shutdown` | None | Requests actual cleanup and process exit; it does not acknowledge successful unload or resolve the milestone. |
+
+`expected_reads` maps existing telemetry names to their exact integer arrays;
+commands cannot introduce memory addresses. An optional named UI predicate must
+already exist in the session. The epoch must match the latest acknowledged
+status. Keys cannot contain analog controls, combinations or macros. Accepted
+sequence numbers are durably consumed before validation or input: a failed guard
+also consumes its number, and retrying an old command cannot press twice. The
+acknowledgement records rejection or the resulting state and next sequence.
+Runtime, identity, cancellation or persistence failures still stop the owner.
+
+There is no automatic resume or checkpoint rebinding. Acquisition can change
+inventory, saves and the objective even after the HUD returns. Preserve and
+validate the new milestone, then use a fresh experiment. An existing
+`handoff.json` and a marker beside the owned control file block startup before
+attachment or checkpoint restoration, including after an explicit shutdown.
+The control marker is checked again under the bridge lock; changing only the
+output directory cannot bypass it. Do not delete that evidence merely to restart
+the old experiment. A fresh host/control session and validated checkpoint belong
+to a new experiment. This mechanism prevents UI from initiating teardown;
+it cannot make an already timed-out remote unload safe to reuse. See the
+[UI lifecycle finding](reference/services.md#item-dialogue-interrupts-a-native-training-episode).
 
 ### In-place player checkpoints
 
