@@ -253,8 +253,20 @@ The first logged target proximity occurred at frame 121–122, leaving about
 first stable-success time. The inferred inter-attempt gaps were 230.44 and
 286.35 ms, including restores of 223.39 and 280.20 ms. This distinguishes
 [post-arrival horizon waiting](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying)
-from actual reset latency. The opt-in objective termination mode needs separate
-live timing; no measured improvement from that mode is claimed here yet.
+from actual reset latency.
+
+A subsequent separately fingerprinted run enabled `stop_on_objective` and retained
+only the living player checkpoint script, with every optional lethal-hook key
+omitted. Its first 15 attempts all completed the objective. Across 14 automatic
+warm retries, player restore median was 206.89 ms (147.57–283.15 ms), and the
+observed terminal-to-next-replay-ACK median was 216.49 ms (155.17–290.91 ms).
+Native terminal-to-next scheduled input gaps were 6–10 guest frames. All reset
+stage proofs and fourteen save hashes passed. Cold setup took 5.799 seconds.
+Navigation median was 4.371 seconds; a mutated policy took 16.812 seconds, so
+actual cumulative throughput was 9.15 attempts/minute, not a uniform four-second
+cycle. Default survival mode still runs to death or its horizon. No natural death
+occurred in this qualification; death uses ordinary recovery while lethal hooks
+are excluded. This isolates instrumentation and does not establish a crash fix.
 
 The fourth candidate crashed with SIGBUS: PC and fault address were
 `main+0x4cbf040`, the `GetTlsValue` import slot, with LR `main+0x49dea4`
