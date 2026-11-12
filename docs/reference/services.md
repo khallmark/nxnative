@@ -358,6 +358,14 @@ Most service calls can be found before they crash, before the first boot or the 
 - **Check:** runner and handoff tests cover interleaved qualification, durable pre-record barriers, incomplete publication, scored objective versus unscored UI evidence, unchanged default resets, stale commands, movement interruption and cancellation failures. See [progression after a qualified objective](../evolution.md#progression-after-a-qualified-objective).
 - **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#in-place-training-checkpoints), after repeated forest waypoint qualification.
 
+### A checkpoint matches once and later turns
+
+- **Symptom:** a native player warp initially matches the checkpoint, then settles with different facing and fails the post-warp stability deadline.
+- **Cause:** open. Initial placement succeeded, but existing first/final samples do not identify the later rotation writer. Translation drift also occurs in successful resets and is not sufficient evidence of the yaw cause.
+- **Fix:** unresolved. Optional diagnostics retain accepted action, completed warp, first readback and first later rotation divergence inside existing native claims. Capture immutable frame/thread/phase and checked action/controller state; reject invalid diagnostic identities without replacing the original reset error. Keep the one-shot mutation, target predicate and deadlines unchanged while investigating.
+- **Check:** exact native C tests cover default behavior, delayed divergence, identity/mapping/code rejection and immutable first capture; envelope tests retain the 16 KiB message and 32 KiB failure-snapshot limits. Live reproduction and a behavioral fix remain pending.
+- **Found on:** [Ocarina of Time](../../dm/games/0400486024DEC000/README.md#rotation-divergence-diagnostics), after 77 successful living starts.
+
 ### Controller disconnect between style and player lookup
 
 - **Symptom:** clang reports a negative shift in `fill` or `vib_targets` (`hle_hid.c`).

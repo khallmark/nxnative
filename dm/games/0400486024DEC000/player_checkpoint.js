@@ -10,7 +10,8 @@ const WARP_OFFSET = 0xc6fb30;
 const ACTION_OFFSET = 0xc08f0;
 const ACTION_PHASE_OFFSET = 0xcba80;
 const PLAYER_VTABLE_OFFSET = 0x4b25e18;
-const PACKET_SIZE = 760;
+const DIRECTION_SETTER_OFFSET = 0x539e20;
+const PACKET_SIZE = 1352;
 const OFF = {
   state: 0, mode: 4, expectedTid: 8, actualTid: 12, error: 16,
   restoreResult: 20, expectedInstance: 24, instance: 32, player: 40,
@@ -38,12 +39,33 @@ const OFF = {
   actionFrame: 656, actionGuestSp: 664, actionCallbackSp: 672, actionStackDelta: 680,
   actionGateSlot: 688, actionTid: 696, previousPoseValid: 700,
   previousPosition: 704, previousRotation: 716, positionDeltaSquared: 752, rotationDelta: 756,
+  traceEnabled: 760, traceSawTarget: 764, traceTargetFrame: 768,
+  tracePhysics: 776, traceModel: 784, traceControllerSet: 792, traceController: 800,
+  traceControllerState: 808, traceBody: 816, traceControllerVtable: 824,
+  traceSetter: 832, tracePhysicsVtable: 840, traceModelVtable: 848, traceCode: 856,
+  traceSamples: 872,
+
 };
 
 const NATIVE_SOURCE = `
 #include <gum/guminterceptor.h>
 #include <stddef.h>
 
+// Four single-publication records, written only inside existing native claims.
+// validity bits:1 actor pose,2 action identity,4 controller identity/finite fields.
+// The guest fields are observational, not a simultaneous whole-game snapshot.
+typedef struct {
+  guint64 frame;
+  guint32 thread_id, phase;
+  volatile gint captured;
+  guint32 validity, action_requested, action_selected, action_flags;
+  float position[3], rotation[9], direction[3], scalar_1d8, scalar_1e0;
+  guint32 flags_20, flags_310, error;
+  float rotation_error;
+} RotationSample;
+typedef char trace_sample_size_check[sizeof(RotationSample) == 120 ? 1 : -1];
+typedef char trace_sample_pose_check[offsetof(RotationSample, position) == 36 ? 1 : -1];
+typedef char trace_sample_direction_check[offsetof(RotationSample, direction) == 84 ? 1 : -1];
 typedef struct {
   volatile gint state;
   guint32 mode, expected_tid, actual_tid, error;
@@ -80,8 +102,15 @@ typedef struct {
   guint32 action_tid, previous_pose_valid;
   float previous_position[3], previous_rotation[9];
   float position_delta_squared, rotation_delta;
+  guint32 trace_enabled, trace_saw_target;
+  guint64 trace_target_frame;
+  guint64 trace_physics, trace_model, trace_controller_set, trace_controller;
+  guint64 trace_controller_state, trace_body, trace_controller_vtable, trace_setter;
+  guint64 trace_physics_vtable, trace_model_vtable;
+  guint32 trace_code[4];
+  RotationSample trace_samples[4];
 } BridgePacket;
-typedef char packet_size_check[sizeof(BridgePacket) == 760 ? 1 : -1];
+typedef char packet_size_check[sizeof(BridgePacket) == 1352 ? 1 : -1];
 typedef char packet_matrix_check[offsetof(BridgePacket, matrix) == 144 ? 1 : -1];
 typedef char packet_tls_check[offsetof(BridgePacket, tls_before) == 216 ? 1 : -1];
 typedef char packet_life_check[offsetof(BridgePacket, life) == 256 ? 1 : -1];
@@ -94,6 +123,9 @@ typedef char packet_action_check[offsetof(BridgePacket, action_bsa) == 592 ? 1 :
 typedef char packet_action_context_check[offsetof(BridgePacket, action_x18_after) == 632 ? 1 : -1];
 typedef char packet_previous_pose_check[offsetof(BridgePacket, previous_position) == 704 ? 1 : -1];
 typedef char packet_motion_delta_check[offsetof(BridgePacket, position_delta_squared) == 752 ? 1 : -1];
+typedef char packet_trace_check[offsetof(BridgePacket, trace_enabled) == 760 ? 1 : -1];
+typedef char packet_trace_code_check[offsetof(BridgePacket, trace_code) == 856 ? 1 : -1];
+typedef char packet_trace_samples_check[offsetof(BridgePacket, trace_samples) == 872 ? 1 : -1];
 extern BridgePacket packet;
 extern gsize g_key18, g_keygate, g_keytls, g_keytlr;
 extern guint8 dm_gate_stubs[];
@@ -172,6 +204,105 @@ static guint action_identity(void) {
       *(guint64 *)(gsize)(packet.action_bsa + 0x1c0) != packet.action_slot0) return 14;
   return 0;
 }
+static guint trace_range(guint64 address, guint64 length, gint protection) {
+  guint64 region = address, size = 0;
+  gint info[16], result;
+  guint32 count = 16, object = 0;
+  if (!address || !length || address + length < address || (address & ((protection & 4) ? 3 : 7))) return 0;
+  result = region_info(task_self_port, &region, &size, 9, info, &count, &object);
+  if (object) port_deallocate(task_self_port, object);
+  return result == 0 && count > 0 && (info[0] & protection) == protection &&
+      address >= region && size >= length && address - region <= size - length;
+}
+static guint trace_chain(void) {
+  guint i;
+  if (*(guint64 *)(gsize)packet.player != packet.player_vtable ||
+      *(guint64 *)(gsize)(packet.player + 0x168) != packet.player ||
+      *(guint64 *)(gsize)(packet.player + 0x270) != packet.components || action_identity()) return 2;
+  if (*(guint64 *)(gsize)(packet.components + 0x50) != packet.trace_physics ||
+      *(guint64 *)(gsize)packet.trace_physics != packet.trace_physics_vtable ||
+      *(guint64 *)(gsize)(packet.trace_physics + 0x38) != packet.player ||
+      *(guint64 *)(gsize)(packet.trace_physics + 0x20) != packet.trace_model ||
+      *(guint64 *)(gsize)packet.trace_model != packet.trace_model_vtable ||
+      *(guint64 *)(gsize)(packet.trace_model + 0x10) != packet.trace_controller_set ||
+      *(guint64 *)(gsize)(packet.trace_model + 0x190) != packet.trace_body ||
+      *(guint64 *)(gsize)(packet.trace_controller_set + 8) != packet.trace_controller ||
+      *(guint64 *)(gsize)packet.trace_controller != packet.trace_controller_vtable ||
+      *(guint64 *)(gsize)(packet.trace_controller + 0x20) != packet.trace_body ||
+      *(guint64 *)(gsize)(packet.trace_controller + 0x28) != packet.trace_controller_state ||
+      *(guint64 *)(gsize)(packet.trace_controller_vtable + 0x50) != packet.trace_setter) return 3;
+  for (i = 0; i != 4; ++i)
+    if (((const guint32 *)(gsize)packet.trace_setter)[i] != packet.trace_code[i]) return 3;
+  return 0;
+}
+static guint trace_finite(float value) { return value == value && value > -1e6f && value < 1e6f; }
+static void trace_capture(guint index, guint phase, guint tid, guint64 frame, guint readback) {
+  RotationSample sample = {0}, *out;
+  guint i, selected;
+  const float *direction;
+  if (!packet.trace_enabled || index >= 4) return;
+  out = &packet.trace_samples[index];
+  if (out->captured) return;
+  sample.frame = frame; sample.thread_id = tid; sample.phase = phase;
+  // Only frozen addresses are read; never follow a newly observed pointer.
+  if (!trace_range(packet.player, 0x34c, 1) || !trace_range(packet.components, 88 * 8, 1) ||
+      !trace_range(packet.action_bsa, 0x1c8, 1) || !trace_range(packet.action_slot0, 0x80, 1) ||
+      !trace_range(packet.trace_physics, 0x40, 1) || !trace_range(packet.trace_model, 0x198, 1) ||
+      !trace_range(packet.trace_controller_set, 16, 1) || !trace_range(packet.trace_controller, 0x30, 1) ||
+      !trace_range(packet.trace_controller_state, 0x314, 1) || !trace_range(packet.trace_body, 8, 1) ||
+      !trace_range(packet.trace_controller_vtable, 0x58, 1) || !trace_range(packet.trace_setter, 16, 5)) {
+    sample.error = 1; goto publish;
+  }
+  sample.error = trace_chain();
+  if (sample.error) goto publish;
+  if (readback) {
+    for (i = 0; i != 3; ++i) sample.position[i] = packet.position_after[i];
+    for (i = 0; i != 9; ++i) sample.rotation[i] = packet.rotation_after[i];
+  } else { copy_position(sample.position); copy_rotation(sample.rotation); }
+  for (i = 0; i != 3; ++i) if (!trace_finite(sample.position[i])) { sample.error = 4; goto publish; }
+  for (i = 0; i != 9; ++i) {
+    float delta = sample.rotation[i] - packet.matrix[(i / 3) * 4 + i % 3];
+    if (!trace_finite(sample.rotation[i])) { sample.error = 4; goto publish; }
+    if (delta < 0) delta = -delta;
+    if (delta > sample.rotation_error) sample.rotation_error = delta;
+  }
+  sample.validity = 1;
+  sample.action_requested = *(guint32 *)(gsize)(packet.action_slot0 + 0x4c);
+  selected = *(guint32 *)(gsize)(packet.action_slot0 + 0x28);
+  sample.action_selected = selected == 0x11a ? sample.action_requested : selected;
+  sample.action_flags = *(guint8 *)(gsize)(packet.action_slot0 + 0x7c);
+  sample.validity |= 2;
+  direction = (const float *)(gsize)(packet.trace_controller_state + 0x1c0);
+  for (i = 0; i != 3; ++i) sample.direction[i] = direction[i];
+  sample.scalar_1d8 = *(float *)(gsize)(packet.trace_controller_state + 0x1d8);
+  sample.scalar_1e0 = *(float *)(gsize)(packet.trace_controller_state + 0x1e0);
+  sample.flags_20 = *(guint32 *)(gsize)(packet.trace_controller_state + 0x20);
+  sample.flags_310 = *(guint32 *)(gsize)(packet.trace_controller_state + 0x310);
+  for (i = 0; i != 3; ++i) if (!trace_finite(sample.direction[i])) { sample.error = 4; goto publish; }
+  if (!trace_finite(sample.scalar_1d8) || !trace_finite(sample.scalar_1e0)) { sample.error = 4; goto publish; }
+  sample.error = trace_chain();
+  if (sample.error) { sample.validity = 0; goto publish; }
+  sample.validity |= 4;
+publish:
+  // No reset error/predicate is modified on diagnostic failure. Publication is
+  // last, with a barrier; JS only consumes immutable captured records.
+  *out = sample;
+  native_cas(0, 1, &out->captured);
+}
+static void trace_readback(guint tid) {
+  guint i, matches = 1;
+  if (!packet.trace_enabled) return;
+  trace_capture(2, 3, tid, packet.frame_after, packet.error ? 0 : 1);
+  if (packet.error) return;
+  for (i = 0; i != 9; ++i) {
+    float delta = packet.rotation_after[i] - packet.matrix[(i / 3) * 4 + i % 3];
+    if (delta != delta || delta > packet.rotation_tolerance || delta < -packet.rotation_tolerance) matches = 0;
+  }
+  if (matches && !packet.trace_saw_target) {
+    packet.trace_target_frame = packet.frame_after; packet.trace_saw_target = 1;
+  } else if (!matches && packet.trace_saw_target && packet.frame_after > packet.trace_target_frame)
+    trace_capture(3, 4, tid, packet.frame_after, 1);
+}
 static void reset_action(gpointer saved_x18) {
   union { guint64 aligned[12]; guint32 words[24]; } request;
   guint32 *words = request.words;
@@ -207,6 +338,7 @@ static void reset_action(gpointer saved_x18) {
   selected = *(guint32 *)(gsize)(packet.action_slot0 + 0x28);
   packet.action_selected = selected == 0x11a ? packet.action_requested : selected;
   if (packet.action_requested != 40 || packet.action_selected != 40) packet.error = 18;
+  if (!packet.error && packet.trace_enabled) trace_capture(0, 1, packet.actual_tid, frame_now(), 0);
 }
 static guint checkpoint_readback(void) {
   guint i, stable = 1;
@@ -402,6 +534,7 @@ static void enter_bridge(GumInvocationContext *ic, guint actor_phase) {
     if (packet.tls_after != packet.tls_before || packet.tlr_after != packet.tlr_before)
       packet.error = 7;
     packet.diagnostic_phase = 7;
+    if (packet.trace_enabled) trace_capture(1, 2, tid, frame_now(), 0);
     if (packet.mode == 2 && !packet.error) {
       packet.diagnostic_phase = 8;
       packet.error = checkpoint_identity();
@@ -452,6 +585,7 @@ void on_leave(GumInvocationContext *ic) {
     packet.diagnostic_phase = 12;
     ++packet.readback_count;
     stable = checkpoint_readback();
+    if (packet.trace_enabled) trace_readback(gum_invocation_context_get_thread_id(ic));
     if (!packet.error && packet.frame_after != packet.last_sample_frame)
       stable = checkpoint_motion_stable() && stable;
     packet.last_readback_stable = stable;
@@ -535,6 +669,40 @@ function requireRange(address, size, protection, label) {
   if (rangeCache.length >= 64) throw new Error('session mapping cache budget exceeded');
   rangeCache.push(range);
 }
+function diagnosticRange(address, size, label) {
+  if (!address.and(7).isNull()) throw new Error(label + ' is not aligned');
+  requireRange(address, size, 'r', label);
+}
+function rotationDiagnosticConfig(config, base, player, components, action) {
+  if (config.rotation_diagnostics !== true) return null;
+  if (!action) throw new Error('rotation_diagnostics requires reset_action');
+  const physics = components.add(0x50).readPointer();
+  diagnosticRange(physics, 0x40, 'diagnostic physics');
+  if (!physics.add(0x38).readPointer().equals(player)) throw new Error('diagnostic physics owner mismatch');
+  const physicsVtable = physics.readPointer(), model = physics.add(0x20).readPointer();
+  diagnosticRange(model, 0x198, 'diagnostic model');
+  const modelVtable = model.readPointer(), controllerSet = model.add(0x10).readPointer();
+  const body = model.add(0x190).readPointer();
+  diagnosticRange(body, 8, 'diagnostic body identity');
+  diagnosticRange(controllerSet, 16, 'diagnostic controller set');
+  const controller = controllerSet.add(8).readPointer();
+  diagnosticRange(controller, 0x30, 'diagnostic controller');
+  const controllerVtable = base.add(0x4c34f10), setter = base.add(DIRECTION_SETTER_OFFSET);
+  diagnosticRange(controllerVtable, 0x58, 'diagnostic controller vtable');
+  if (!controller.readPointer().equals(controllerVtable) ||
+      !controller.add(0x20).readPointer().equals(body) ||
+      !controllerVtable.add(0x50).readPointer().equals(setter)) throw new Error('diagnostic controller identity mismatch');
+  const controllerState = controller.add(0x28).readPointer();
+  diagnosticRange(controllerState, 0x314, 'diagnostic controller state');
+  if (!player.add(0x270).readPointer().equals(components) ||
+      !components.add(0x50).readPointer().equals(physics) || !physics.readPointer().equals(physicsVtable) ||
+      !physics.add(0x38).readPointer().equals(player) || !physics.add(0x20).readPointer().equals(model) ||
+      !model.readPointer().equals(modelVtable) || !model.add(0x10).readPointer().equals(controllerSet) ||
+      !model.add(0x190).readPointer().equals(body) || !controllerSet.add(8).readPointer().equals(controller) ||
+      !controller.add(0x28).readPointer().equals(controllerState)) throw new Error('diagnostic chain changed');
+  return {physics, model, controllerSet, controller, controllerState, body, controllerVtable, setter,
+    physicsVtable, modelVtable, code: config.address_binding.code_fingerprints['0x539e20'].slice(0, 32)};
+}
 function checkpointConfig(config, base, player) {
   const binding = config.address_binding;
   const components = player.add(0x270).readPointer();
@@ -608,8 +776,9 @@ function checkpointConfig(config, base, player) {
       throw new Error('BSA action binding mismatch');
     action = {bsa, bsaVtable, slot0};
   }
+  const rotationTrace = rotationDiagnosticConfig(config, base, player, components, action);
   return { components, life, hpRecord, maxRecord, lifeVtable, hudFlags, plusFlags,
-    hudVtable, plusVtable, maximum, targetHealth, matrix, tolerance, rotationTolerance, requiredFrames, action };
+    hudVtable, plusVtable, maximum, targetHealth, matrix, tolerance, rotationTolerance, requiredFrames, action, rotationTrace };
 }
 function validate(config, nonce) {
   if (!config || typeof config !== 'object' || typeof nonce !== 'string' || !nonce)
@@ -626,9 +795,14 @@ function validate(config, nonce) {
     throw new Error('code_fingerprints required');
   if (config.reset_action !== undefined && typeof config.reset_action !== 'boolean')
     throw new Error('reset_action must be boolean');
+  if (config.rotation_diagnostics !== undefined && typeof config.rotation_diagnostics !== 'boolean')
+    throw new Error('rotation_diagnostics must be boolean');
+  if (config.rotation_diagnostics === true && (config.mode !== 'player_checkpoint' || config.reset_action !== true))
+    throw new Error('rotation_diagnostics requires player_checkpoint and reset_action');
   if (config.reset_action === true && config.mode !== 'player_checkpoint')
     throw new Error('reset_action requires player_checkpoint mode');
-  for (const offset of [SELECTOR_OFFSET, WARP_OFFSET, ...(config.reset_action === true ? [ACTION_OFFSET, ACTION_PHASE_OFFSET] : [])]) {
+  for (const offset of [SELECTOR_OFFSET, WARP_OFFSET, ...(config.reset_action === true ? [ACTION_OFFSET, ACTION_PHASE_OFFSET] : []),
+    ...(config.rotation_diagnostics === true ? [DIRECTION_SETTER_OFFSET] : [])]) {
     const key = '0x' + offset.toString(16);
     const expected = fingerprints[key];
     if (typeof expected !== 'string' || !/^(?:[0-9a-f]{2}){16,64}$/i.test(expected))
@@ -652,7 +826,8 @@ function validate(config, nonce) {
   const identity = [Process.id, BUILD_ID, base.toString(), player.toString(),
     fingerprints['0x3303ca0'].toLowerCase(), fingerprints['0xc6fb30'].toLowerCase(),
     config.reset_action === true ? fingerprints['0xc08f0'].toLowerCase() + ':' +
-      fingerprints['0xcba80'].toLowerCase() : 'no-action-reset'].join(':');
+      fingerprints['0xcba80'].toLowerCase() : 'no-action-reset',
+    config.rotation_diagnostics === true ? fingerprints['0x539e20'].toLowerCase() : 'no-rotation-trace'].join(':');
   if (mode === 'warp') {
     if (config.confirm_warp !== true || !proof || proof.identity !== identity ||
         config.dryrun_nonce !== proof.nonce)
@@ -662,7 +837,8 @@ function validate(config, nonce) {
       throw new Error('finite row-major Matrix34 target_matrix required');
   }
   const checkpoint = mode === 'player_checkpoint' ? checkpointConfig(config, base, player) : null;
-  return { base, player, expectedVtable, mode, timeout, identity, checkpoint };
+  return { base, player, expectedVtable, mode, timeout, identity, checkpoint,
+    rotationDiagnostics: config.rotation_diagnostics === true };
 }
 const DIAGNOSTIC_PHASES = ['idle', 'callback_entered', 'identity_checked',
   'permission_check_before_warp', 'ready_for_warp', 'warp_entered', 'warp_returned',
@@ -730,6 +906,36 @@ function physicsObservation(run) {
     return result;
   } catch (error) { return {available: false, atomic: false, error: String(error).slice(0, 160)}; }
 }
+function rotationTrace(run) {
+  try {
+    const p = run.packet;
+    const names = ['wait_accepted', 'warp_completed', 'first_readback', 'first_rotation_divergence'];
+    const records = names.map((name, index) => {
+      const r = p.add(OFF.traceSamples + index * 120);
+      if (r.add(16).readS32() !== 1) return {phase: name, captured: false};
+      const vector = (offset, count) => Array.from({length: count}, (_, i) => r.add(offset + 4 * i).readFloat());
+      const validity = r.add(20).readU32();
+      return {phase: name, phase_id: r.add(12).readU32(), captured: true,
+        frame: r.readU64().toString(), thread_id: r.add(8).readU32(), validity,
+        error: r.add(112).readU32(), rotation_error: validity & 1 ? r.add(116).readFloat() : null,
+        position: validity & 1 ? vector(36, 3) : null, rotation: validity & 1 ? vector(48, 9) : null,
+        action: validity & 2 ? [r.add(24).readU32(), r.add(28).readU32(), r.add(32).readU32()] : null,
+        direction: validity & 4 ? vector(84, 3) : null,
+        scalars: validity & 4 ? vector(96, 2) : null,
+        flags: validity & 4 ? [r.add(104).readU32(), r.add(108).readU32()] : null};
+    });
+    const bindings = {};
+    for (const name of ['physics', 'model', 'controllerSet', 'controller', 'controllerState', 'body',
+      'controllerVtable', 'setter', 'physicsVtable', 'modelVtable']) {
+      const field = 'trace' + name[0].toUpperCase() + name.slice(1);
+      bindings[name] = p.add(OFF[field]).readPointer().toString();
+    }
+    return {version: 1, atomic_guest_state: false, bindings, action_fields: ['requested', 'selected', 'slot_flags'],
+      scalar_offsets: ['0x1d8', '0x1e0'], flag_offsets: ['0x20', '0x310'],
+      target_seen: p.add(OFF.traceSawTarget).readU32() === 1,
+      target_frame: p.add(OFF.traceTargetFrame).readU64().toString(), records};
+  } catch (error) { return {available: false, error: String(error).slice(0, 160)}; }
+}
 function diagnostics(run) {
   // Only bounded reads: no NativeFunction, guest call, mapping lookup or cleanup.
   const p = run.packet, stateBefore = p.add(OFF.state).readS32();
@@ -789,6 +995,7 @@ function diagnostics(run) {
     result.live_observation = live;
   } catch (error) { result.live_observation = {available: false, error: String(error).slice(0, 160)}; }
   result.physics_observation = physicsObservation(run);
+  if (run.rotationDiagnostics) result.rotation_trace = rotationTrace(run);
   result.state_after = p.add(OFF.state).readS32();
   result.snapshot_consistent = stateBefore !== 2 && stateBefore !== 6 && stateBefore === result.state_after &&
     phaseBefore === u32(OFF.diagnosticPhase) && readsBefore === u32(OFF.readbackCount);
@@ -864,11 +1071,19 @@ function finish(run) {
       threadId: evidence.thread_id, instance: evidence.main_instance };
   }
   if (failed) proof = null;
-  if (run.dryrunEvidence) evidence.dryrun = run.dryrunEvidence;
+  if (run.dryrunEvidence) {
+    evidence.dryrun = run.rotationDiagnostics ? {...run.dryrunEvidence,
+      diagnostics: {version: 1, phase: run.dryrunEvidence.diagnostics.phase,
+        error_code: run.dryrunEvidence.error_code, details: 'dryrun_verified phase evidence'}} : run.dryrunEvidence;
+  }
   run.result = { event: failed ? 'failed' : (run.mode === 'player_checkpoint' ? 'restored' :
       (run.mode === 'dryrun' ? 'dryrun' : 'warped')),
     terminal: true, nonce: run.nonce, descriptor_restored: true,
-    diagnostics: evidence.diagnostics,
+    // The opt-in trace is retained once in evidence. Duplicating four records
+    // here can overflow the runner's16KiB message envelope after JSON encoding.
+    diagnostics: run.rotationDiagnostics ? {version: 1, phase: evidence.diagnostics.phase,
+      phase_name: evidence.diagnostics.phase_name, error_code: evidence.error_code,
+      details: 'evidence.diagnostics'} : evidence.diagnostics,
     semantics: run.mode === 'player_checkpoint' ? 'player_checkpoint' : run.mode,
     error: failed ? 'native checkpoint failed (code ' + evidence.error_code + ')' : undefined,
     reason: run.timedOut ? 'timeout; native callback was allowed to finish' :
@@ -899,6 +1114,15 @@ rpc.exports = {
       packet.add(OFF.tolerance).writeFloat(cp.tolerance);
       packet.add(OFF.rotationTolerance).writeFloat(cp.rotationTolerance);
       cp.matrix.forEach((value, i) => packet.add(OFF.matrix + i * 4).writeFloat(value));
+      if (cp.rotationTrace) {
+        packet.add(OFF.traceEnabled).writeU32(1);
+        for (const name of ['physics', 'model', 'controllerSet', 'controller', 'controllerState', 'body',
+          'controllerVtable', 'setter', 'physicsVtable', 'modelVtable']) {
+          const field = 'trace' + name[0].toUpperCase() + name.slice(1);
+          packet.add(OFF[field]).writePointer(cp.rotationTrace[name]);
+        }
+        packet.add(OFF.traceCode).writeByteArray(cp.rotationTrace.code.match(/../g).map(byte => parseInt(byte, 16)));
+      }
       if (cp.action) {
         packet.add(OFF.actionEnabled).writeU32(1);
         packet.add(OFF.actionBsa).writePointer(cp.action.bsa);

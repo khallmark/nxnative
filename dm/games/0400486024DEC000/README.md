@@ -293,6 +293,38 @@ preserves a qualified candidate at its reached waypoint before the old checkpoin
 is restored. It supplies supervised bounded movement, not automatic checkpoint
 adoption or completion of the game's remaining objectives.
 
+The shop qualification subsequently completed five scored trials with health 10
+and no damage. Candidate zero passed both interleaved repeats; the resident owner
+held at the reached doorway without another checkpoint restore. An observation
+and a six-frame button-free movement used that same owner, verified inactive
+terminal input and preserved all fourteen save hashes. Navigation took
+1.55–2.07 seconds. This no-Frida run used ordinary Load (about 14–15 seconds), so
+it validates progression handoff rather than fast-reset performance.
+
+### Rotation divergence diagnostics
+
+The reset-yaw cause remains open. The opt-in `rotation_diagnostics: true` requires
+`reset_action: true` and a fresh, verified fingerprint for `main+0x539e20` under
+`address_binding.code_fingerprints["0x539e20"]`. It records accepted Wait,
+completed warp, first Main readback, and the first later rotation mismatch after
+a target-matching readback. Each of four immutable records has its own thread,
+frame and phase, checked actor pose, action selection/flags, and controller
+direction/scalars/flags. The captures use existing native ownership claims and
+recheck frozen pointer chains, mapped spans and code identity. Guest observations
+are not atomic across all fields. Invalid diagnostic data is marked unavailable
+without changing the reset error or completion predicate.
+
+The full trace is `evidence.diagnostics.rotation_trace` in terminal messages and
+`diagnostics.rotation_trace` in snapshots. With this opt-in, the top-level terminal
+diagnostics and nested dryrun diagnostics are summaries to avoid duplicating the
+trace. Constructed maximum restored/failed Python JSON messages measured
+11,811/11,944 bytes, with snapshots 19,900/20,059 bytes, below the existing
+16 KiB and 32 KiB limits. The exact native C passed normal and ASan/UBSan tests,
+including first-divergence retention and invalid mapping/identity cases; the
+219-test evolution slice passed. Live diagnostic reproduction is pending. No
+reset deadline, target tolerance, warp mode or one-shot mutation rule changes,
+and no yaw fix or improved reset reliability is claimed.
+
 The earlier fully instrumented run's fourth candidate crashed with SIGBUS: PC and fault address were
 `main+0x4cbf040`, the `GetTlsValue` import slot, with LR `main+0x49dea4`
 in the health-update function containing the optional lethal hooks. Bounded
@@ -340,6 +372,7 @@ Its 37 kernels that correct samples, NDSR's network among them, gave about 0.25 
 
 ## Found on this game
 
+- [A checkpoint matches once and later turns](../../../docs/reference/services.md#a-checkpoint-matches-once-and-later-turns): bounded per-stage evidence distinguishes a later controller update from a failed placement without relaxing reset validation.
 - [A qualified navigation policy resets the reached milestone](../../../docs/reference/services.md#a-qualified-navigation-policy-resets-the-reached-milestone): a resident objective boundary preserves a fully repeated candidate and enables supervised continuation before checkpoint restoration.
 - [A successful navigation trial waits before retrying](../../../docs/reference/services.md#a-successful-navigation-trial-waits-before-retrying): the forest trials spent about fifteen seconds after first logged target proximity before their fixed horizon; explicit objective termination separates navigation speed from survival evaluation.
 - [Timed movement overshoots when presented frames slow down](../../../docs/reference/services.md#timed-movement-overshoots-when-presented-frames-slow-down): guarded native target steering adds position feedback and braking; live terrain/deadzone qualification remains separate from the synthetic model.
